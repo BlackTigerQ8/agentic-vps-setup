@@ -181,7 +181,7 @@ echo -e "  [ ] 3. DNS A Record configured:"
 echo -e "         Type: A  |  Name: n8n  |  Content: [Your VPS IP]"
 echo -e "         (This creates n8n.yourdomain.com)"
 echo -e "  [ ] 4. DNS propagation has been waited for (5-30 minutes)"
-echo -e "  [ ] 5. API Key is ready for your chosen AI model (Gemini or OpenAI)"
+echo -e "  [ ] 5. API Key is ready for your chosen AI model (Gemini, OpenAI, or Claude)"
 echo ""
 separator
 echo ""
@@ -236,12 +236,13 @@ echo "  Select the AI provider for OpenClaw:"
 echo ""
 echo "  [1] Google Gemini  (recommended - Free tier available)"
 echo "  [2] OpenAI (GPT-4o, GPT-4.1, etc.)"
+echo "  [3] Anthropic Claude (Claude Sonnet 4, Opus, etc.)"
 echo ""
 
 AI_CHOICE=""
-while [[ ! "$AI_CHOICE" =~ ^[12]$ ]]; do
-    read -rp "  [?] Enter your choice [1 or 2]: " AI_CHOICE
-    [[ ! "$AI_CHOICE" =~ ^[12]$ ]] && print_warn "Invalid choice. Please enter 1 or 2."
+while [[ ! "$AI_CHOICE" =~ ^[1-3]$ ]]; do
+    read -rp "  [?] Enter your choice [1, 2, or 3]: " AI_CHOICE
+    [[ ! "$AI_CHOICE" =~ ^[1-3]$ ]] && print_warn "Invalid choice. Please enter 1, 2, or 3."
 done
 
 if [ "$AI_CHOICE" = "1" ]; then
@@ -267,7 +268,7 @@ if [ "$AI_CHOICE" = "1" ]; then
     esac
     API_KEY_LABEL="Gemini API Key (get it from: https://aistudio.google.com/app/apikey)"
     API_KEY_ENV="GEMINI_API_KEY"
-else
+elif [ "$AI_CHOICE" = "2" ]; then
     AI_PROVIDER="openai"
     AI_LABEL="OpenAI"
     echo ""
@@ -292,6 +293,29 @@ else
     esac
     API_KEY_LABEL="OpenAI API Key (get it from: https://platform.openai.com/api-keys)"
     API_KEY_ENV="OPENAI_API_KEY"
+else
+    AI_PROVIDER="anthropic"
+    AI_LABEL="Anthropic Claude"
+    echo ""
+    echo -e "  ${BOLD}Available Claude Models:${RESET}"
+    echo "  [1] claude-sonnet-4-20250514   (balanced power + speed - RECOMMENDED)"
+    echo "  [2] claude-4-opus-20250514     (highest capability, complex tasks)"
+    echo "  [3] claude-3.5-haiku           (fast, cost-effective)"
+    echo "  [4] claude-3.5-sonnet          (strong all-rounder)"
+    echo ""
+    MODEL_CHOICE=""
+    while [[ ! "$MODEL_CHOICE" =~ ^[1-4]$ ]]; do
+        read -rp "  [?] Select Claude model [1-4]: " MODEL_CHOICE
+        [[ ! "$MODEL_CHOICE" =~ ^[1-4]$ ]] && print_warn "Please enter 1, 2, 3, or 4."
+    done
+    case "$MODEL_CHOICE" in
+        1) AI_MODEL="claude-sonnet-4-20250514" ;;
+        2) AI_MODEL="claude-4-opus-20250514" ;;
+        3) AI_MODEL="claude-3-5-haiku-20241022" ;;
+        4) AI_MODEL="claude-3-5-sonnet-20241022" ;;
+    esac
+    API_KEY_LABEL="Anthropic API Key (get it from: https://console.anthropic.com/settings/keys)"
+    API_KEY_ENV="ANTHROPIC_API_KEY"
 fi
 
 echo ""
@@ -402,14 +426,11 @@ run_quietly "Creating deployment directory at ${DEPLOY_DIR}" mkdir -p "$DEPLOY_D
 
 print_step "Generating docker-compose.yml ..."
 
-# Escape backslashes and dollar signs for heredoc safety
-SAFE_N8N_PASS="${N8N_PASS//\\/\\\\}"
-SAFE_N8N_PASS="${SAFE_N8N_PASS//\$/\\\$}"
-SAFE_AI_API_KEY="${AI_API_KEY//\\/\\\\}"
-SAFE_AI_API_KEY="${SAFE_AI_API_KEY//\$/\\\$}"
+# Escape dollar signs for docker-compose (uses $$ for a literal $)
+SAFE_N8N_PASS="${N8N_PASS//\$/\$\$}"
+SAFE_AI_API_KEY="${AI_API_KEY//\$/\$\$}"
 
 cat > "${DEPLOY_DIR}/docker-compose.yml" << ENDOFCOMPOSE
-version: '3.8'
 
 services:
 
