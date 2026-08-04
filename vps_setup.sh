@@ -9,10 +9,11 @@
 #                                        |___/                                  
 #   Agentic AI Bootcamp — Automated VPS Setup Script
 #   Covers: Phase 1 to 6 from the VPS Setup Guide
-#   Author: Eng. Abdullah Alenezi | Version: 1.0.0
+#   Author: Eng. Abdullah Alenezi | Version: 2.0.0
 # =============================================================================
 
 set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
 
 # --- Color Palette -----------------------------------------------------------
 RED='\033[0;31m'
@@ -180,7 +181,7 @@ echo -e "  [ ] 3. DNS A Record configured:"
 echo -e "         Type: A  |  Name: n8n  |  Content: [Your VPS IP]"
 echo -e "         (This creates n8n.yourdomain.com)"
 echo -e "  [ ] 4. DNS propagation has been waited for (5-30 minutes)"
-echo -e "  [ ] 5. API Key is ready for your chosen AI model (Gemini or OpenAI)"
+echo -e "  [ ] 5. API Key is ready for your chosen AI model (Gemini, OpenAI, or Claude)"
 echo ""
 separator
 echo ""
@@ -235,12 +236,13 @@ echo "  Select the AI provider for OpenClaw:"
 echo ""
 echo "  [1] Google Gemini  (recommended - Free tier available)"
 echo "  [2] OpenAI (GPT-4o, GPT-4.1, etc.)"
+echo "  [3] Anthropic Claude (Claude Sonnet 4, Opus, etc.)"
 echo ""
 
 AI_CHOICE=""
-while [[ ! "$AI_CHOICE" =~ ^[12]$ ]]; do
-    read -rp "  [?] Enter your choice [1 or 2]: " AI_CHOICE
-    [[ ! "$AI_CHOICE" =~ ^[12]$ ]] && print_warn "Invalid choice. Please enter 1 or 2."
+while [[ ! "$AI_CHOICE" =~ ^[1-3]$ ]]; do
+    read -rp "  [?] Enter your choice [1, 2, or 3]: " AI_CHOICE
+    [[ ! "$AI_CHOICE" =~ ^[1-3]$ ]] && print_warn "Invalid choice. Please enter 1, 2, or 3."
 done
 
 if [ "$AI_CHOICE" = "1" ]; then
@@ -266,7 +268,7 @@ if [ "$AI_CHOICE" = "1" ]; then
     esac
     API_KEY_LABEL="Gemini API Key (get it from: https://aistudio.google.com/app/apikey)"
     API_KEY_ENV="GEMINI_API_KEY"
-else
+elif [ "$AI_CHOICE" = "2" ]; then
     AI_PROVIDER="openai"
     AI_LABEL="OpenAI"
     echo ""
@@ -291,6 +293,29 @@ else
     esac
     API_KEY_LABEL="OpenAI API Key (get it from: https://platform.openai.com/api-keys)"
     API_KEY_ENV="OPENAI_API_KEY"
+else
+    AI_PROVIDER="anthropic"
+    AI_LABEL="Anthropic Claude"
+    echo ""
+    echo -e "  ${BOLD}Available Claude Models:${RESET}"
+    echo "  [1] claude-sonnet-4-20250514   (balanced power + speed - RECOMMENDED)"
+    echo "  [2] claude-4-opus-20250514     (highest capability, complex tasks)"
+    echo "  [3] claude-3.5-haiku           (fast, cost-effective)"
+    echo "  [4] claude-3.5-sonnet          (strong all-rounder)"
+    echo ""
+    MODEL_CHOICE=""
+    while [[ ! "$MODEL_CHOICE" =~ ^[1-4]$ ]]; do
+        read -rp "  [?] Select Claude model [1-4]: " MODEL_CHOICE
+        [[ ! "$MODEL_CHOICE" =~ ^[1-4]$ ]] && print_warn "Please enter 1, 2, 3, or 4."
+    done
+    case "$MODEL_CHOICE" in
+        1) AI_MODEL="claude-sonnet-4-20250514" ;;
+        2) AI_MODEL="claude-4-opus-20250514" ;;
+        3) AI_MODEL="claude-3-5-haiku-20241022" ;;
+        4) AI_MODEL="claude-3-5-sonnet-20241022" ;;
+    esac
+    API_KEY_LABEL="Anthropic API Key (get it from: https://console.anthropic.com/settings/keys)"
+    API_KEY_ENV="ANTHROPIC_API_KEY"
 fi
 
 echo ""
@@ -349,16 +374,17 @@ fi
 # =============================================================================
 print_phase "PHASE 2 -- System Update & Firewall Hardening"
 
-run_quietly "Updating package lists" apt update
-run_quietly "Upgrading installed packages" apt upgrade -y
-run_quietly "Installing essential tools" apt install -y curl wget gnupg2 ca-certificates lsb-release ufw dnsutils
+run_quietly "Updating package lists" apt-get update
+run_quietly "Upgrading installed packages" apt-get upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
+run_quietly "Installing essential tools" apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" curl wget gnupg2 ca-certificates lsb-release ufw dnsutils
 
 print_step "Configuring UFW firewall ..."
 ufw --force reset        >/dev/null 2>&1
 ufw default deny incoming  >/dev/null 2>&1
 ufw default allow outgoing >/dev/null 2>&1
 ufw allow OpenSSH          >/dev/null 2>&1
-ufw allow 'Nginx Full'     >/dev/null 2>&1
+ufw allow 80/tcp           >/dev/null 2>&1
+ufw allow 443/tcp          >/dev/null 2>&1
 ufw --force enable         >/dev/null 2>&1
 print_ok "Firewall configured: SSH and Nginx (80/443) are allowed"
 
@@ -386,7 +412,7 @@ DOCKER_COMPOSE_VER=$(docker compose version 2>/dev/null || echo "")
 if [ -n "$DOCKER_COMPOSE_VER" ]; then
     print_ok "Docker Compose plugin: ${DOCKER_COMPOSE_VER}"
 else
-    run_quietly "Installing docker-compose-plugin" apt install -y docker-compose-plugin
+    run_quietly "Installing docker-compose-plugin" apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" docker-compose-plugin
     print_ok "Docker Compose plugin installed"
 fi
 
@@ -400,14 +426,11 @@ run_quietly "Creating deployment directory at ${DEPLOY_DIR}" mkdir -p "$DEPLOY_D
 
 print_step "Generating docker-compose.yml ..."
 
-if [ "$AI_PROVIDER" = "gemini" ]; then
-    AI_ENV_LINES="      - GEMINI_API_KEY=${AI_API_KEY}\n      - OPENAI_API_KEY=not-used"
-else
-    AI_ENV_LINES="      - GEMINI_API_KEY=not-used\n      - OPENAI_API_KEY=${AI_API_KEY}"
-fi
+# Escape dollar signs for docker-compose (uses $$ for a literal $)
+SAFE_N8N_PASS="${N8N_PASS//\$/\$\$}"
+SAFE_AI_API_KEY="${AI_API_KEY//\$/\$\$}"
 
 cat > "${DEPLOY_DIR}/docker-compose.yml" << ENDOFCOMPOSE
-version: '3.8'
 
 services:
 
@@ -424,7 +447,7 @@ services:
       - WEBHOOK_URL=https://${N8N_SUBDOMAIN}/
       - N8N_BASIC_AUTH_ACTIVE=true
       - N8N_BASIC_AUTH_USER=${N8N_USER}
-      - N8N_BASIC_AUTH_PASSWORD=${N8N_PASS}
+      - N8N_BASIC_AUTH_PASSWORD=${SAFE_N8N_PASS}
       - N8N_EDITOR_BASE_URL=https://${N8N_SUBDOMAIN}/
       - GENERIC_TIMEZONE=UTC
       - N8N_METRICS=false
@@ -442,7 +465,7 @@ services:
     environment:
       - AI_PROVIDER=${AI_PROVIDER}
       - AI_MODEL=${AI_MODEL}
-      - ${API_KEY_ENV}=${AI_API_KEY}
+      - ${API_KEY_ENV}=${SAFE_AI_API_KEY}
       - NODE_ENV=production
     volumes:
       - openclaw_data:/app/data
@@ -474,11 +497,66 @@ print_ok "Containers started:"
 docker compose ps
 
 # =============================================================================
+#   PHASE 4b: OpenClaw Post-Boot Stabilization
+# =============================================================================
+echo ""
+separator
+echo ""
+echo -e "  ${BOLD}OpenClaw Gateway Stabilization${RESET}"
+print_info "Waiting for OpenClaw gateway to fully initialize ..."
+
+# Wait for the OpenClaw container to report healthy/running
+OPENCLAW_READY=false
+for i in $(seq 1 15); do
+    if docker exec openclaw openclaw status --quiet >/dev/null 2>&1; then
+        OPENCLAW_READY=true
+        break
+    fi
+    sleep 2
+done
+
+if [ "$OPENCLAW_READY" = true ]; then
+    print_ok "OpenClaw gateway is running"
+else
+    print_warn "OpenClaw may still be starting. Continuing with stabilization ..."
+fi
+
+# Step 4b.1: Run doctor to clear any restart-loop breaker state
+print_step "Running 'openclaw doctor --fix' to clear restart-loop breaker ..."
+if docker exec openclaw openclaw doctor --fix >/tmp/setup_last_output.log 2>&1; then
+    print_ok "Doctor fix completed — gateway state is clean"
+else
+    print_warn "Doctor returned warnings (usually harmless). Continuing ..."
+fi
+
+# Step 4b.2: Pre-install WhatsApp and Telegram plugins
+print_step "Pre-installing WhatsApp and Telegram channel plugins ..."
+if docker exec openclaw openclaw plugins install clawhub:@openclaw/whatsapp clawhub:@openclaw/telegram >/tmp/setup_last_output.log 2>&1; then
+    print_ok "WhatsApp and Telegram plugins installed"
+else
+    print_warn "Plugin install returned warnings. Plugins may already be installed."
+fi
+
+# Step 4b.3: Restart OpenClaw cleanly to load plugins
+print_step "Restarting OpenClaw for a clean boot with plugins loaded ..."
+docker compose restart openclaw >/tmp/setup_last_output.log 2>&1
+sleep 8
+print_ok "OpenClaw restarted with plugins active"
+
+# Step 4b.4: Verify channel health
+print_step "Verifying channel health ..."
+if docker exec openclaw openclaw channels status --probe >/tmp/setup_last_output.log 2>&1; then
+    print_ok "Channel providers are active and ready for pairing"
+else
+    print_warn "Channel probe returned warnings. WhatsApp/Telegram can still be paired later."
+fi
+
+# =============================================================================
 #   PHASE 5: Nginx Reverse Proxy
 # =============================================================================
 print_phase "PHASE 5 -- Nginx Reverse Proxy Configuration"
 
-run_quietly "Installing Nginx" apt install -y nginx
+run_quietly "Installing Nginx" apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" nginx
 
 print_step "Writing Nginx config for ${N8N_SUBDOMAIN} ..."
 
@@ -527,14 +605,12 @@ ENDOFNGINX
 print_ok "Nginx config written to /etc/nginx/sites-available/n8n"
 
 # Enable site
-[ -L "/etc/nginx/sites-enabled/n8n" ] && rm /etc/nginx/sites-enabled/n8n
+rm -f "/etc/nginx/sites-enabled/n8n"
 ln -s /etc/nginx/sites-available/n8n /etc/nginx/sites-enabled/n8n
 
 # Disable default site to avoid conflicts
-if [ -L "/etc/nginx/sites-enabled/default" ]; then
-    rm /etc/nginx/sites-enabled/default
-    print_info "Default Nginx site disabled (port conflict prevention)"
-fi
+rm -f "/etc/nginx/sites-enabled/default"
+print_info "Default Nginx site disabled (port conflict prevention)"
 
 print_step "Testing Nginx configuration ..."
 if nginx -t >/tmp/setup_last_output.log 2>&1; then
@@ -554,7 +630,7 @@ print_ok "Nginx is running as reverse proxy for ${N8N_SUBDOMAIN}"
 # =============================================================================
 print_phase "PHASE 6 -- SSL/TLS Certificate (Let's Encrypt / Certbot)"
 
-run_quietly "Installing Certbot and Nginx plugin" apt install -y certbot python3-certbot-nginx
+run_quietly "Installing Certbot and Nginx plugin" apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" certbot python3-certbot-nginx
 
 print_step "Requesting SSL certificate for ${N8N_SUBDOMAIN} ..."
 print_info "DNS must be fully propagated for this to succeed."
@@ -587,7 +663,7 @@ fi
 if systemctl is-active --quiet certbot.timer 2>/dev/null; then
     print_ok "Certbot auto-renewal timer is active"
 elif ! crontab -l 2>/dev/null | grep -q certbot; then
-    (crontab -l 2>/dev/null; echo "0 3 * * * certbot renew --quiet && systemctl reload nginx") | crontab -
+    (crontab -l 2>/dev/null || true; echo "0 3 * * * certbot renew --quiet && systemctl reload nginx") | crontab -
     print_ok "Certbot renewal cron job added (runs daily at 3:00 AM)"
 fi
 
@@ -613,6 +689,12 @@ else
     print_warn "n8n may still be starting. Wait 30 seconds then run: docker compose ps"
 fi
 
+if ss -tlnp 2>/dev/null | grep -q ':8080'; then
+    print_ok "OpenClaw: listening on port 8080"
+else
+    print_warn "OpenClaw may still be starting. Check: docker compose logs openclaw"
+fi
+
 # =============================================================================
 #   Setup Complete!
 # =============================================================================
@@ -626,20 +708,30 @@ echo -e "${RESET}"
 
 echo -e "  ${BOLD}Your Agentic AI Stack is now live:${RESET}"
 echo ""
-echo -e "  n8n Dashboard:   ${CYAN}https://${N8N_SUBDOMAIN}${RESET}"
-echo -e "  Username:        ${CYAN}${N8N_USER}${RESET}"
-echo -e "  Password:        [the one you entered]"
-echo -e "  AI Provider:     ${CYAN}${AI_LABEL} (${AI_MODEL})${RESET}"
+echo -e "  n8n Dashboard:      ${CYAN}https://${N8N_SUBDOMAIN}${RESET}"
+echo -e "  Username:           ${CYAN}${N8N_USER}${RESET}"
+echo -e "  Password:           [the one you entered]"
+echo -e "  AI Provider:        ${CYAN}${AI_LABEL} (${AI_MODEL})${RESET}"
+echo -e "  OpenClaw Dashboard: ${CYAN}http://localhost:8080 (via SSH tunnel)${RESET}"
 echo ""
 separator
 echo ""
 echo -e "  ${BOLD}Useful Commands:${RESET}"
 echo "  View containers:     docker compose -f ${DEPLOY_DIR}/docker-compose.yml ps"
 echo "  View n8n logs:       docker compose -f ${DEPLOY_DIR}/docker-compose.yml logs -f n8n"
+echo "  View OpenClaw logs:  docker compose -f ${DEPLOY_DIR}/docker-compose.yml logs -f openclaw"
 echo "  Restart services:    docker compose -f ${DEPLOY_DIR}/docker-compose.yml restart"
 echo "  Stop services:       docker compose -f ${DEPLOY_DIR}/docker-compose.yml down"
 echo "  Retry SSL:           certbot --nginx --email $CERTBOT_EMAIL -d $N8N_SUBDOMAIN"
 echo "  Nginx error log:     tail -f /var/log/nginx/error.log"
+echo ""
+separator
+echo ""
+echo -e "  ${BOLD}Channel Pairing (Day 3):${RESET}"
+echo -e "  SSH Tunnel:          ${CYAN}ssh -L 8080:127.0.0.1:8080 root@${VPS_IP}${RESET}"
+echo -e "  Dashboard:           ${CYAN}http://localhost:8080${RESET}"
+echo -e "  Pair WhatsApp:       ${CYAN}docker exec -it openclaw openclaw channels login --channel whatsapp${RESET}"
+echo -e "  Channel Status:      ${CYAN}docker exec -it openclaw openclaw channels status --probe${RESET}"
 echo ""
 separator
 echo ""
