@@ -12,9 +12,10 @@ The script automates the installation, configuration, and orchestration of:
 *   **Security:** System updates and `UFW` firewall configuration (restricting access to standard SSH and HTTP/HTTPS).
 *   **Containerization:** Official `Docker Engine` & `Docker Compose` plugin setup.
 *   **n8n Workflow Automation:** Containerized instance running on a custom bridge network, mapped locally to loopback, secured via basic auth, and using persisted volumes.
-*   **OpenClaw Gateway:** Integrates with the trainee's preferred AI model provider (Google Gemini or OpenAI) dynamically.
+*   **OpenClaw Gateway:** Integrates with the trainee's preferred AI model provider (Google Gemini, OpenAI, or Anthropic Claude) dynamically.
 *   **Nginx Reverse Proxy:** Routes public domain requests to containerized services, supports WebSocket updates, and implements a meta GET verification bypass for WhatsApp/Meta Webhooks.
 *   **Certbot (Let's Encrypt):** Automates HTTPS encryption with redirects and sets up daily cron timers for renewal.
+*   **WhatsApp Fix Script (`fix_openclaw.sh`):** A companion one-liner script that repairs the OpenClaw dashboard's WhatsApp QR code rendering by clearing the restart-loop breaker, restarting the gateway, and verifying channel health.
 
 ---
 
@@ -60,6 +61,36 @@ sudo bash vps_setup.sh
 
 ---
 
+## 🩺 WhatsApp Dashboard Fix (Day 3+)
+
+After the initial VPS setup, the OpenClaw dashboard may not render the WhatsApp QR code due to a restart-loop breaker that suppresses channel auto-start. A companion fix script resolves this automatically.
+
+### One-Line Fix Command
+
+Run this on your VPS terminal **before** attempting to pair WhatsApp:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/BlackTigerQ8/agentic-vps-setup/main/fix_openclaw.sh -o fix_openclaw.sh && sudo bash fix_openclaw.sh
+```
+
+### What It Does
+
+| Phase | Action |
+| :--- | :--- |
+| **1. Auto-Detect** | Finds the running OpenClaw container (`openclaw` or `openclaw-gateway`) and the compose directory (`/opt/agentic-stack` or `/root/n8n-automation`). |
+| **2. Doctor Fix** | Runs `openclaw doctor --fix` to clear the restart-loop breaker, validate config, and clean stale tokens. |
+| **3. Clean Restart** | Restarts the container via `docker compose restart` so the gateway boots fresh with all channel providers enabled. |
+| **4. Health Check** | Runs `openclaw channels status --probe` to verify the WhatsApp provider is active. |
+
+After the script finishes, open the OpenClaw dashboard in your browser and click **Show QR** under Channels → WhatsApp.
+
+> **Fallback:** If the dashboard QR still fails, pair via terminal:
+> ```bash
+> docker exec -it openclaw openclaw channels login --channel whatsapp
+> ```
+
+---
+
 ## 🧭 Interactive Wizard Parameters
 
 The wizard will prompt you for the following inputs:
@@ -67,9 +98,9 @@ The wizard will prompt you for the following inputs:
 *   **Root Domain:** Used to generate your subdomains.
 *   **Certbot Email:** Required by Let's Encrypt to send SSL expiry alerts.
 *   **n8n Credentials:** Admin username and password (enforced minimum of 8 characters) to secure your n8n workspace.
-*   **AI Provider Selection:** Choose between Google Gemini or OpenAI.
-*   **Model Selection:** Choose the exact engine deployment (e.g., `gemini-2.0-flash`, `gpt-4o-mini`, etc.).
-*   **API Key:** Paste your secure token (e.g., Gemini API key or OpenAI key).
+*   **AI Provider Selection:** Choose between Google Gemini, OpenAI, or Anthropic Claude.
+*   **Model Selection:** Choose the exact engine deployment (e.g., `gemini-2.0-flash`, `gpt-4o-mini`, `claude-sonnet-4`, etc.).
+*   **API Key:** Paste your secure token (e.g., Gemini API key, OpenAI key, or Anthropic key).
 
 ---
 
@@ -92,8 +123,16 @@ cd /opt/agentic-stack
 
 *   **View container status:** `docker compose ps`
 *   **Inspect n8n container logs:** `docker compose logs -f n8n`
+*   **Inspect OpenClaw logs:** `docker compose logs -f openclaw`
 *   **Restart the stack:** `docker compose restart`
 *   **Stop the stack:** `docker compose down`
+
+### OpenClaw Channel Management
+*   **Fix dashboard & WhatsApp QR:** `curl -fsSL https://raw.githubusercontent.com/BlackTigerQ8/agentic-vps-setup/main/fix_openclaw.sh -o fix_openclaw.sh && sudo bash fix_openclaw.sh`
+*   **Pair WhatsApp via terminal:** `docker exec -it openclaw openclaw channels login --channel whatsapp`
+*   **Check channel health:** `docker exec -it openclaw openclaw channels status --probe`
+*   **Run diagnostics:** `docker exec -it openclaw openclaw doctor --fix`
+*   **Logout WhatsApp session:** `docker exec -it openclaw openclaw channels logout`
 
 ### Web Server & SSL Management
 *   **Test Nginx Configuration:** `nginx -t`
