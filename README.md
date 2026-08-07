@@ -185,6 +185,32 @@ It is on port **18789**, not 8080. You do not need an SSH tunnel — use `https:
 
 ---
 
+## Already running the old setup?
+
+Re-run the same one-liner. It upgrades in place — you do not need a fresh server.
+
+**First, add the missing DNS record:**
+
+| Type | Name | Value |
+| :-- | :-- | :-- |
+| A | `claw` | your VPS IP address |
+
+Then re-run the installer. It detects the old install and migrates it:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/BlackTigerQ8/agentic-vps-setup/main/vps_setup.sh -o vps_setup.sh && sudo bash vps_setup.sh
+```
+
+**What you keep:** your n8n workflows, saved credentials and n8n login. The installer finds your existing n8n data, reads its encryption key and reuses it, so nothing is re-encrypted or lost.
+
+**What changes:** the old OpenClaw container (the broken one on port 8080) is removed and replaced. OpenClaw had never successfully saved any state, so there is nothing to migrate there — you will set it up fresh, which takes about a minute.
+
+**You will be asked again** for your domain, email, timezone, AI provider and API key, plus a new dashboard password. The old install saved none of these anywhere the script could read.
+
+> Your API key was previously stored in a world-readable file. If that bothers you, rotate it at your provider before re-running and enter the new one.
+
+---
+
 ## Instructor notes
 
 **Pin image versions before class** so every trainee runs an identical build:
@@ -207,6 +233,8 @@ Run the script yourself first, note the versions it pulled with `sudo agentic st
 - Adds swap, container memory ceilings and log rotation
 - Waits for DNS instead of failing; detects the AAAA-record trap
 - Ships the `agentic` helper and `diagnose.sh`
+
+**3.0.1** — upgrading in place from the old setup now preserves n8n's encryption key instead of injecting a new one (which stopped n8n from starting), and removes the dead port-8080 OpenClaw container instead of leaving it running as an orphan.
 
 ---
 
