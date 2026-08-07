@@ -7,7 +7,7 @@
 #   Behind:  Nginx + Let's Encrypt, Docker Compose, UFW
 #
 #   Author: Eng. Abdullah Alenezi
-#   Version: 3.0.0
+#   Version: 3.0.1
 #
 #   Safe to re-run. Every phase is idempotent.
 # =============================================================================
@@ -15,7 +15,7 @@
 set -Eeuo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
-SCRIPT_VERSION="3.0.0"
+SCRIPT_VERSION="3.0.1"
 DEPLOY_DIR="/opt/agentic-stack"
 CONF_FILE="/etc/agentic-stack.conf"
 CREDS_FILE="/root/AGENTIC-CREDENTIALS.txt"
@@ -634,6 +634,18 @@ fi
 # =============================================================================
 print_phase "PHASE 5 / 9  --  Writing the stack configuration"
 
+# --- Migration from setup v2 -------------------------------------------------
+# v2 ran OpenClaw in a container called "openclaw" published on port 8080,
+# which was never the port the gateway listens on. It is not in the new compose
+# file, so Compose would leave it running as an orphan - wasting memory on a
+# small VPS and confusing anyone reading `docker ps`. Its named volume is left
+# alone; only the dead container goes.
+if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx 'openclaw'; then
+    print_warn "Found the old 'openclaw' container from the previous setup."
+    print_info "It was bound to port 8080, which the gateway never listened on."
+    run_soft "Removing the old OpenClaw container" docker rm -f openclaw || true
+fi
+
 mkdir -p "$DEPLOY_DIR"/{openclaw,openclaw-workspace,openclaw-secrets}
 chmod 700 "$DEPLOY_DIR"
 
@@ -655,9 +667,53 @@ load_or_create_secret() {
 }
 
 # OPENCLAW_GATEWAY_TOKEN is the password the trainee chose in Phase 1.
-# The n8n encryption key is internal - it is generated once and never shown,
-# but it must survive re-runs or n8n loses access to its saved credentials.
-N8N_ENCRYPTION_KEY="$(load_or_create_secret N8N_ENCRYPTION_KEY "openssl rand -hex 24")"
+#
+# The n8n encryption key is internal and never shown, but it is the one value
+# that must never change: n8n encrypts saved credentials with it. On its very
+# first start n8n generates one and writes it to config inside its volume. If we
+# then hand it a DIFFERENT key through the environment, n8n refuses to boot with
+# "Mismatching encryption keys". So: if a volume already exists, its key wins.
+print_step "Checking for existing n8n data ..."
+EXISTING_N8N_KEY=""
+N8N_VOLUME=""
+for v in "$(basename "$DEPLOY_DIR")_n8n_data" "agentic-stack_n8n_data"; do
+    if docker volume inspect "$v" >/dev/null 2>&1; then N8N_VOLUME="$v"; break; fi
+done
+if [ -n "$N8N_VOLUME" ]; then
+    VOL_PATH="$(docker volume inspect -f '{{.Mountpoint}}' "$N8N_VOLUME" 2>/dev/null || true)"
+    if [ -n "$VOL_PATH" ] && [ -f "${VOL_PATH}/config" ]; then
+        EXISTING_N8N_KEY="$(jq -r '.encryptionKey // empty' "${VOL_PATH}/config" 2>/dev/null || true)"
+        # Fall back to plain text extraction if jq is missing or the file is
+        # not clean JSON. Getting this wrong bricks the trainee's n8n, so it
+        # is worth a second attempt rather than silently generating a new key.
+        if [ -z "$EXISTING_N8N_KEY" ]; then
+            EXISTING_N8N_KEY="$(grep -o '"encryptionKey"[[:space:]]*:[[:space:]]*"[^"]*"' "${VOL_PATH}/config" 2>/dev/null \
+                | head -n1 | sed 's/.*:[[:space:]]*"\(.*\)"$/\1/' || true)"
+        fi
+    fi
+fi
+
+# Safety net: an existing volume whose key we could not read must not be handed
+# a new one. Leaving N8N_ENCRYPTION_KEY unset lets n8n keep using its own.
+if [ -n "$N8N_VOLUME" ] && [ -z "$EXISTING_N8N_KEY" ] && [ ! -f "${DEPLOY_DIR}/stack.env" ]; then
+    print_warn "An n8n volume exists but its encryption key could not be read."
+    print_info "Letting n8n manage its own key so your saved credentials keep working."
+    SKIP_N8N_KEY=true
+else
+    SKIP_N8N_KEY=false
+fi
+
+N8N_ENCRYPTION_KEY=""
+if [ "$SKIP_N8N_KEY" = true ]; then
+    :
+elif [ -n "$EXISTING_N8N_KEY" ]; then
+    N8N_ENCRYPTION_KEY="$EXISTING_N8N_KEY"
+    print_ok "Found your existing n8n data - keeping its encryption key"
+    print_info "Your workflows, credentials and n8n account all survive this upgrade."
+else
+    N8N_ENCRYPTION_KEY="$(load_or_create_secret N8N_ENCRYPTION_KEY "openssl rand -hex 24")"
+    print_ok "$([ -n "$N8N_VOLUME" ] && echo "Re-using the stored n8n encryption key" || echo "New n8n instance - generated a fresh encryption key")"
+fi
 
 # Image tags: override before running, e.g. AGENTIC_N8N_TAG=1.130.0 bash vps_setup.sh
 N8N_TAG="${AGENTIC_N8N_TAG:-latest}"
@@ -669,9 +725,13 @@ cat >"${DEPLOY_DIR}/stack.env" <<EOF
 # Secrets for the Agentic AI stack. Keep this file private (chmod 600).
 # Values are read literally - do not add quotes.
 OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN}
-N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
 ${API_KEY_ENV}=${AI_API_KEY}
 EOF
+# Omitted entirely when n8n already owns a key we could not read - an empty or
+# wrong N8N_ENCRYPTION_KEY stops n8n from starting.
+if [ -n "$N8N_ENCRYPTION_KEY" ]; then
+    echo "N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}" >>"${DEPLOY_DIR}/stack.env"
+fi
 chmod 600 "${DEPLOY_DIR}/stack.env"
 print_ok "Secrets written (file is readable by root only)"
 
