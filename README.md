@@ -1,148 +1,213 @@
-# 🚀 CODED Agentic AI VPS Setup Wizard
+# CODED Agentic AI — VPS Setup Wizard
 
-An automated, interactive Bash script to provision, secure, and deploy a complete **Agentic AI Stack** (`n8n` workflow automation + `OpenClaw` LLM engine gateway) behind an `Nginx` reverse proxy with automatic `Let's Encrypt` SSL certificates on a fresh Ubuntu VPS.
+One command turns a blank Ubuntu VPS into a working agentic-AI workstation:
 
-Developed specifically for trainees of the **CODED Agentic AI Bootcamp**.
+| Service | Address | What it is |
+| :-- | :-- | :-- |
+| **n8n** | `https://n8n.yourdomain.com` | Workflow automation |
+| **OpenClaw** | `https://claw.yourdomain.com` | AI gateway + dashboard |
 
----
+Both sit behind Nginx with a free Let's Encrypt certificate. Neither application port is exposed to the internet. **No SSH tunnel is needed for anything.**
 
-## 🛠️ The Stack
-
-The script automates the installation, configuration, and orchestration of:
-*   **Security:** System updates and `UFW` firewall configuration (restricting access to standard SSH and HTTP/HTTPS).
-*   **Containerization:** Official `Docker Engine` & `Docker Compose` plugin setup.
-*   **n8n Workflow Automation:** Containerized instance running on a custom bridge network, mapped locally to loopback, secured via basic auth, and using persisted volumes.
-*   **OpenClaw Gateway:** Integrates with the trainee's preferred AI model provider (Google Gemini, OpenAI, or Anthropic Claude) dynamically.
-*   **Nginx Reverse Proxy:** Routes public domain requests to containerized services, supports WebSocket updates, and implements a meta GET verification bypass for WhatsApp/Meta Webhooks.
-*   **Certbot (Let's Encrypt):** Automates HTTPS encryption with redirects and sets up daily cron timers for renewal.
-*   **WhatsApp Fix Script (`fix_openclaw.sh`):** A companion one-liner script that repairs the OpenClaw dashboard's WhatsApp QR code rendering by clearing the restart-loop breaker, restarting the gateway, and verifying channel health.
+Built for trainees of the CODED Agentic AI Bootcamp. Version **3.0.0**.
 
 ---
 
-## 📋 Pre-flight Checklist (Required Before Running)
+## Before you run it
 
-Before executing the setup wizard, ensure you have completed the following steps:
+You need three things. Do these in order.
 
-1.  **A Fresh VPS:** Standard Ubuntu 22.04 LTS or 24.04 LTS server (from providers like Hostinger).
-2.  **A Domain Name:** A registered domain (e.g., `my-agent-platform.com`).
-3.  **DNS A-Record Configuration:**
-    *   In your domain registrar settings, add a new **A Record**.
-    *   **Host/Name:** `n8n` (which creates the subdomain `n8n.yourdomain.com`).
-    *   **Value/Content:** Your VPS Public IP address.
-    *   *Note: Wait 5–15 minutes for propagation before running the script so SSL verification succeeds.*
+**1. A VPS** — Ubuntu 22.04 or 24.04, minimum 4 GB RAM. A fresh server is best.
+
+**2. A domain** — any registrar.
+
+**3. Two DNS records.** This is the step people get wrong, so read it twice.
+
+In your domain provider's DNS panel, add **two A records**:
+
+| Type | Name | Value | TTL |
+| :-- | :-- | :-- | :-- |
+| A | `n8n` | your VPS IP address | lowest offered |
+| A | `claw` | your VPS IP address | lowest offered |
+
+Then check for **AAAA records** on those two names. If your provider created any, **delete them**. An AAAA record on a server without IPv6 makes the SSL certificate fail every time, and the error message does not tell you that.
+
+DNS takes 1–30 minutes to spread. The setup script waits for it, so you can start right away.
 
 ---
 
-## 🚀 Quick Start (One-Line Execution)
+## Run it
 
-You can run the installer using either of these two methods on your VPS terminal:
+Connect to your server:
 
-### Option A: Direct Download & Run (Recommended - No Git Required)
-This method uses `curl` (pre-installed on almost all VPS images) to pull the script directly from GitHub without needing to configure Git or clone the whole repository:
+```bash
+ssh root@YOUR_VPS_IP
+```
+
+Then run:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/BlackTigerQ8/agentic-vps-setup/main/vps_setup.sh -o vps_setup.sh && sudo bash vps_setup.sh
 ```
 
-### Option B: Clone Repository (Requires Git)
-If you want to clone the entire repository to view or modify files locally on your server:
+It asks for your domain, email, timezone, AI provider, API key, and **a password for your OpenClaw dashboard** — pick one you'll remember, 12 characters minimum. Everything else is automatic. Expect 5–12 minutes, mostly downloading.
+
+**The script is safe to run again.** If something fails, fix the cause and re-run it — it skips whatever is already done and never issues a duplicate certificate.
+
+---
+
+## After it finishes
+
+### n8n
+
+Open `https://n8n.yourdomain.com` and create your account on the first screen. n8n manages its own users; there is no separate server password.
+
+### OpenClaw dashboard
+
+Open `https://claw.yourdomain.com` and enter **the dashboard password you chose during setup**. OpenClaw's screen calls it a *gateway token* — it's the same thing.
+
+Forgotten it?
 
 ```bash
-# 1. Update packages and install git
-sudo apt update && sudo apt install -y git
-
-# 2. Clone the repository
-git clone https://github.com/BlackTigerQ8/agentic-vps-setup.git
-
-# 3. Navigate and execute
-cd agentic-vps-setup
-sudo bash vps_setup.sh
+sudo agentic token
 ```
 
----
-
-## 🩺 WhatsApp Dashboard Fix (Day 3+)
-
-After the initial VPS setup, the OpenClaw dashboard may not render the WhatsApp QR code due to a restart-loop breaker that suppresses channel auto-start. A companion fix script resolves this automatically.
-
-### One-Line Fix Command
-
-Run this on your VPS terminal **before** attempting to pair WhatsApp:
+Or skip typing entirely — this prints a one-time link that logs you straight in:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/BlackTigerQ8/agentic-vps-setup/main/fix_openclaw.sh -o fix_openclaw.sh && sudo bash fix_openclaw.sh
+sudo agentic open
 ```
 
-### What It Does
+If the browser says **"pairing required"**, approve the device:
 
-| Phase | Action |
-| :--- | :--- |
-| **1. Auto-Detect** | Finds the running OpenClaw container (`openclaw` or `openclaw-gateway`) and the compose directory (`/opt/agentic-stack` or `/root/n8n-automation`). |
-| **2. Doctor Fix** | Runs `openclaw doctor --fix` to clear the restart-loop breaker, validate config, and clean stale tokens. |
-| **3. Clean Restart** | Restarts the container via `docker compose restart` so the gateway boots fresh with all channel providers enabled. |
-| **4. Health Check** | Runs `openclaw channels status --probe` to verify the WhatsApp provider is active. |
-
-After the script finishes, open the OpenClaw dashboard in your browser and click **Show QR** under Channels → WhatsApp.
-
-> **Fallback:** If the dashboard QR still fails, pair via terminal:
-> ```bash
-> docker exec -it openclaw openclaw channels login --channel whatsapp
-> ```
-
----
-
-## 🧭 Interactive Wizard Parameters
-
-The wizard will prompt you for the following inputs:
-*   **VPS Public IP:** Used to double-check DNS settings via `dig` before issuing certificates.
-*   **Root Domain:** Used to generate your subdomains.
-*   **Certbot Email:** Required by Let's Encrypt to send SSL expiry alerts.
-*   **n8n Credentials:** Admin username and password (enforced minimum of 8 characters) to secure your n8n workspace.
-*   **AI Provider Selection:** Choose between Google Gemini, OpenAI, or Anthropic Claude.
-*   **Model Selection:** Choose the exact engine deployment (e.g., `gemini-2.0-flash`, `gpt-4o-mini`, `claude-sonnet-4`, etc.).
-*   **API Key:** Paste your secure token (e.g., Gemini API key, OpenAI key, or Anthropic key).
-
----
-
-## 📂 Directories & Paths Created
-
-Once finished, the stack components will be located at:
-*   **Docker Workspace:** `/opt/agentic-stack/` (contains `docker-compose.yml` and persisted volume mappings).
-*   **Nginx Site Config:** `/etc/nginx/sites-available/n8n` (symlinked to `/etc/nginx/sites-enabled/n8n`).
-*   **System Logs:** `/tmp/setup_last_output.log` (useful for inspecting installation issues if a step fails).
-
----
-
-## 🔧 Useful Administration Commands
-
-### Docker Compose Management
-Navigate to the stack directory:
 ```bash
-cd /opt/agentic-stack
+sudo agentic approve
 ```
 
-*   **View container status:** `docker compose ps`
-*   **Inspect n8n container logs:** `docker compose logs -f n8n`
-*   **Inspect OpenClaw logs:** `docker compose logs -f openclaw`
-*   **Restart the stack:** `docker compose restart`
-*   **Stop the stack:** `docker compose down`
+### WhatsApp
 
-### OpenClaw Channel Management
-*   **Fix dashboard & WhatsApp QR:** `curl -fsSL https://raw.githubusercontent.com/BlackTigerQ8/agentic-vps-setup/main/fix_openclaw.sh -o fix_openclaw.sh && sudo bash fix_openclaw.sh`
-*   **Pair WhatsApp via terminal:** `docker exec -it openclaw openclaw channels login --channel whatsapp`
-*   **Check channel health:** `docker exec -it openclaw openclaw channels status --probe`
-*   **Run diagnostics:** `docker exec -it openclaw openclaw doctor --fix`
-*   **Logout WhatsApp session:** `docker exec -it openclaw openclaw channels logout`
+```bash
+sudo agentic whatsapp
+```
 
-### Web Server & SSL Management
-*   **Test Nginx Configuration:** `nginx -t`
-*   **Reload Nginx settings:** `systemctl reload nginx`
-*   **Force SSL Renewal Check:** `certbot renew --dry-run`
+A QR code appears in your terminal. On your phone: **WhatsApp → Settings → Linked devices → Link a device**, then scan.
 
 ---
 
-## ✍️ Author & Maintenance
+## The `agentic` command
 
-*   **Author:** Eng. Abdullah Alenezi
-*   **Organization:** CODED Agentic AI Bootcamp
-*   **Version:** 1.0.0
+The setup script installs a helper so nobody has to remember Docker commands.
+
+```bash
+sudo agentic help
+```
+
+| Command | What it does |
+| :-- | :-- |
+| `agentic status` | Full health check — containers, SSL, DNS, memory |
+| `agentic open` | One-click OpenClaw dashboard login link |
+| `agentic token` | Show your OpenClaw dashboard password |
+| `agentic safebrowsing` | Steps to clear Chrome's red "Deceptive site" page |
+| `agentic urls` | Print your two links |
+| `agentic logs n8n` | Follow n8n logs live |
+| `agentic logs claw` | Follow OpenClaw logs live |
+| `agentic restart` | Restart everything |
+| `agentic whatsapp` | Pair WhatsApp |
+| `agentic approve` | Approve a device waiting to log in |
+| `agentic model` | List or change the AI model |
+| `agentic doctor` | OpenClaw self-repair |
+| `agentic ssl` | Issue or renew the certificate |
+| `agentic dns` | Check that DNS points here |
+| `agentic update` | Pull the newest images |
+| `agentic backup` | Save n8n + OpenClaw data to `/root/backups` |
+| `agentic creds` | Show your saved credentials |
+
+---
+
+## Something is wrong
+
+Run the health report and send the output to your instructor. It changes nothing:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/BlackTigerQ8/agentic-vps-setup/main/diagnose.sh -o diagnose.sh && sudo bash diagnose.sh
+```
+
+Every failing line comes with the command that fixes it.
+
+### Common problems
+
+**"Your connection is not private" / certificate error**
+The certificate did not cover the address you opened. Run `sudo agentic status` — it prints exactly which names the certificate covers. Then `sudo agentic ssl`.
+
+**"Deceptive site ahead" / "Dangerous site" (a red Google page)**
+
+This is **not** an SSL problem — your certificate is valid. It's a Google Safe Browsing false positive that self-hosted n8n gets hit with periodically.
+
+*To keep working right now:* click **Details** on the red page, then **visit this unsafe site**.
+
+*To clear it properly:*
+
+1. Open [Google Search Console](https://search.google.com/search-console)
+2. Add a **Domain** property for `yourdomain.com` (not a URL-prefix property — a Domain property covers both subdomains at once). Verify it with the TXT record it gives you.
+3. Go to **Security & Manual Actions → Security Issues**
+4. Click **Request Review**. Describe it as a private automation tool for your own use, not a public website.
+
+Reviews usually clear in 1–3 days. Check the current verdict any time at [Google's Transparency Report](https://transparencyreport.google.com/safe-browsing/search).
+
+Run `sudo agentic safebrowsing` on the server for these steps.
+
+The setup already does what it can to avoid a repeat flag: `noindex` headers and a blocking `robots.txt` on both sites, HTTPS enforced, and requests to the bare IP refused instead of being served the n8n login page.
+
+> **Instructors:** have trainees add the Search Console TXT record at the same time as the two A records, the day before class. Then a review request is a single click instead of a ten-minute detour.
+
+**The SSL certificate will not issue**
+Nearly always DNS. Run `sudo agentic dns`. Look for a leftover **AAAA record** — delete it and retry.
+
+**Everything is slow**
+Check `sudo agentic status`. If swap shows 0 MB, re-run the setup script; it adds a swap file, which is the usual fix on a 4 GB VPS.
+
+**The OpenClaw dashboard will not load**
+It is on port **18789**, not 8080. You do not need an SSH tunnel — use `https://claw.yourdomain.com`.
+
+---
+
+## Where things live
+
+| Path | Contents |
+| :-- | :-- |
+| `/opt/agentic-stack/docker-compose.yml` | The stack definition |
+| `/opt/agentic-stack/stack.env` | Secrets — mode 600, root only |
+| `/opt/agentic-stack/openclaw/openclaw.json` | OpenClaw gateway config |
+| `/etc/nginx/sites-available/n8n`, `.../claw` | Reverse proxy configs |
+| `/root/AGENTIC-CREDENTIALS.txt` | Your links and tokens |
+| `/var/log/agentic-setup.log` | Full setup transcript |
+| `/etc/agentic-stack.conf` | Saved answers, reused on re-runs |
+
+---
+
+## Instructor notes
+
+**Pin image versions before class** so every trainee runs an identical build:
+
+```bash
+AGENTIC_N8N_TAG=1.130.0 AGENTIC_OPENCLAW_TAG=2026.7.1 sudo -E bash vps_setup.sh
+```
+
+Run the script yourself first, note the versions it pulled with `sudo agentic status`, and give trainees that command. This removes a whole class of "it worked for her but not for me" problems.
+
+**What changed in 3.0.0**
+
+- OpenClaw moved to its own HTTPS subdomain — the SSH tunnel is gone
+- Fixed the OpenClaw port (18789, not 8080) and container name
+- The trainee chooses their own OpenClaw dashboard password during setup, so dashboard login works and they remember it
+- OpenClaw config and credentials persist across restarts (the old volume path was wrong, so nothing was saved)
+- Dropped the `N8N_BASIC_AUTH_*` variables — n8n removed them in v1.0, so they had no effect
+- Certbot runs in `--webroot` mode and never rewrites the Nginx config
+- Requests to the bare IP are refused instead of serving the n8n login page
+- Adds swap, container memory ceilings and log rotation
+- Waits for DNS instead of failing; detects the AAAA-record trap
+- Ships the `agentic` helper and `diagnose.sh`
+
+---
+
+**Author:** Eng. Abdullah Alenezi — CODED Agentic AI Bootcamp

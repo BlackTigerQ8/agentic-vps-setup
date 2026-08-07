@@ -1,742 +1,1572 @@
 #!/usr/bin/env bash
-
 # =============================================================================
-#   ____ ___  ____  _____ ____       _                    _   _         _   ___
-#  / ___/ _ \|  _ \| ____|  _ \     / \   __ _  ___ _ __ | |_(_) ___   / \ |_ _|
-# | |  | | | | | | |  _| | | | |   / _ \ / _` |/ _ \ '_ \| __| |/ __| / _ \ | |
-# | |__| |_| | |_| | |___| |_| |  / ___ \ (_| |  __/ | | | |_| | (__ / ___ \| |
-#  \____\___/|____/|_____|____/  /_/   \_\__, |\___|_| |_|\__|_|\___/_/   \_\___|
-#                                        |___/                                  
-#   Agentic AI Bootcamp — Automated VPS Setup Script
-#   Covers: Phase 1 to 6 from the VPS Setup Guide
-#   Author: Eng. Abdullah Alenezi | Version: 2.0.0
+#   CODED Agentic AI Bootcamp - Automated VPS Setup
+#
+#   Deploys: n8n  -> https://n8n.<domain>
+#            OpenClaw dashboard -> https://claw.<domain>
+#   Behind:  Nginx + Let's Encrypt, Docker Compose, UFW
+#
+#   Author: Eng. Abdullah Alenezi
+#   Version: 3.0.0
+#
+#   Safe to re-run. Every phase is idempotent.
 # =============================================================================
 
-set -euo pipefail
+set -Eeuo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
-# --- Color Palette -----------------------------------------------------------
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-MAGENTA='\033[0;35m'
-BOLD='\033[1m'
-DIM='\033[2m'
-RESET='\033[0m'
+SCRIPT_VERSION="3.0.0"
+DEPLOY_DIR="/opt/agentic-stack"
+CONF_FILE="/etc/agentic-stack.conf"
+CREDS_FILE="/root/AGENTIC-CREDENTIALS.txt"
+LOG_FILE="/var/log/agentic-setup.log"
+WEBROOT="/var/www/acme"
+OPENCLAW_PORT=18789
+N8N_PORT=5678
+DOCKER_SUBNET="172.28.0.0/16"
+DOCKER_GW="172.28.0.1"
 
-# --- Utility Functions -------------------------------------------------------
-print_banner() {
-    clear
-    echo -e "${CYAN}"
-    echo "  +====================================================================+"
-    echo "  |      >>> Agentic AI Bootcamp - VPS Setup Wizard <<<               |"
-    echo "  |           Automated by CODED Bootcamp Instructor                  |"
-    echo "  +====================================================================+"
-    echo -e "${RESET}"
-}
+# --- Colors ------------------------------------------------------------------
+if [ -t 1 ]; then
+    RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'
+    BLUE=$'\033[0;34m'; CYAN=$'\033[0;36m'; MAGENTA=$'\033[0;35m'
+    BOLD=$'\033[1m'; DIM=$'\033[2m'; RESET=$'\033[0m'
+else
+    RED=""; GREEN=""; YELLOW=""; BLUE=""; CYAN=""; MAGENTA=""
+    BOLD=""; DIM=""; RESET=""
+fi
+
+# --- Output helpers ----------------------------------------------------------
+_log() { printf '%s %s\n' "$(date '+%F %T')" "$1" >>"$LOG_FILE" 2>/dev/null || true; }
 
 print_phase() {
     echo ""
-    echo -e "${MAGENTA}${BOLD}==================================================================${RESET}"
-    echo -e "${MAGENTA}${BOLD}  >> $1${RESET}"
-    echo -e "${MAGENTA}${BOLD}==================================================================${RESET}"
+    echo "${MAGENTA}${BOLD}================================================================${RESET}"
+    echo "${MAGENTA}${BOLD}  $1${RESET}"
+    echo "${MAGENTA}${BOLD}================================================================${RESET}"
     echo ""
+    _log "PHASE: $1"
+}
+print_step() { echo "  ${BLUE}>${RESET} $1"; _log "STEP: $1"; }
+print_ok()   { echo "  ${GREEN}[ OK ]${RESET} $1"; _log "OK: $1"; }
+print_warn() { echo "  ${YELLOW}[WARN]${RESET} ${YELLOW}$1${RESET}"; _log "WARN: $1"; }
+print_error(){ echo "  ${RED}[FAIL]${RESET} ${RED}$1${RESET}"; _log "FAIL: $1"; }
+print_info() { echo "  ${DIM}[info] $1${RESET}"; _log "INFO: $1"; }
+separator()  { echo "${DIM}  ----------------------------------------------------------------${RESET}"; }
+
+die() {
+    echo ""
+    print_error "$1"
+    echo ""
+    print_info "Full setup log: ${LOG_FILE}"
+    print_info "Last command output: /tmp/agentic_last.log"
+    exit 1
 }
 
-print_step() { echo -e "  ${BLUE}>${RESET} $1"; }
-print_ok()   { echo -e "  ${GREEN}[OK]${RESET}  $1"; }
-print_warn() { echo -e "  ${YELLOW}[WARN]${RESET} ${YELLOW}$1${RESET}"; }
-print_error(){ echo -e "  ${RED}[ERR]${RESET}  ${RED}$1${RESET}"; }
-print_info() { echo -e "  ${DIM}[INFO] $1${RESET}"; }
-separator()  { echo -e "${DIM}  ----------------------------------------------------------------${RESET}"; }
-
-ask() {
-    local var_name="$1"
-    local prompt="$2"
-    local default="${3:-}"
-    local value=""
-    if [ -n "$default" ]; then
-        read -rp "  [?] $prompt [$default]: " value
-        value="${value:-$default}"
-    else
-        while [ -z "$value" ]; do
-            read -rp "  [?] $prompt: " value
-            [ -z "$value" ] && print_warn "This field cannot be empty. Please try again."
-        done
+on_error() {
+    local exit_code=$?
+    local line=${1:-?}
+    echo ""
+    print_error "Setup stopped unexpectedly (exit ${exit_code}, line ${line})."
+    if [ -s /tmp/agentic_last.log ]; then
+        echo ""
+        print_info "Last command output:"
+        tail -n 40 /tmp/agentic_last.log
     fi
-    printf -v "$var_name" '%s' "$value"
+    echo ""
+    print_info "Nothing is broken - you can safely re-run this script after fixing the cause."
+    print_info "Full log: ${LOG_FILE}"
+    exit "$exit_code"
+}
+trap 'on_error $LINENO' ERR
+
+# --- Input helpers -----------------------------------------------------------
+ask() {
+    local __var="$1" prompt="$2" default="${3:-}" value=""
+    while :; do
+        if [ -n "$default" ]; then
+            read -rp "  ${CYAN}?${RESET} ${prompt} ${DIM}[${default}]${RESET}: " value || true
+            value="${value:-$default}"
+        else
+            read -rp "  ${CYAN}?${RESET} ${prompt}: " value || true
+        fi
+        value="$(echo "$value" | tr -d '[:space:]')"
+        [ -n "$value" ] && break
+        print_warn "This cannot be empty."
+    done
+    printf -v "$__var" '%s' "$value"
 }
 
 ask_secret() {
-    local var_name="$1"
-    local prompt="$2"
-    local value=""
-    while [ -z "$value" ]; do
-        read -rsp "  [?] $prompt: " value
+    # Trims surrounding whitespace only. Stripping inner characters would
+    # silently change what the user thinks they typed - the worst possible
+    # outcome for a password they must retype in a browser later.
+    local __var="$1" prompt="$2" minlen="${3:-1}" value=""
+    while :; do
+        read -rsp "  ${CYAN}?${RESET} ${prompt}: " value || true
         echo ""
-        [ -z "$value" ] && print_warn "This field cannot be empty. Please try again."
+        value="${value#"${value%%[![:space:]]*}"}"   # trim leading
+        value="${value%"${value##*[![:space:]]}"}"   # trim trailing
+        if [ "${#value}" -lt "$minlen" ]; then
+            print_warn "Must be at least ${minlen} characters. You entered ${#value}."
+            continue
+        fi
+        break
     done
-    printf -v "$var_name" '%s' "$value"
+    printf -v "$__var" '%s' "$value"
 }
 
 confirm() {
-    local prompt="$1"
     local answer=""
-    read -rp "  [?] $prompt [y/N]: " answer
-    [[ "$answer" =~ ^[Yy]$ ]]
+    read -rp "  ${CYAN}?${RESET} $1 ${DIM}[y/N]${RESET}: " answer || true
+    [[ "$answer" =~ ^[Yy]([Ee][Ss])?$ ]]
 }
 
-check_root() {
-    if [ "$EUID" -ne 0 ]; then
-        print_error "This script must be run as root (or with sudo)."
-        print_info  "Re-run: sudo bash vps_setup.sh"
-        exit 1
-    fi
-}
-
-command_exists() { command -v "$1" &>/dev/null; }
-
-# --- Spinner -----------------------------------------------------------------
-spinner_pid=""
-start_spinner() {
-    local msg="$1"
-    local chars='|/-\\'
-    (
-        i=0
-        while true; do
-            printf "\r  [%s]  %s  " "${chars:$((i % 4)):1}" "$msg"
-            sleep 0.15
-            ((i++)) || true
-        done
-    ) &
-    spinner_pid=$!
-    disown "$spinner_pid" 2>/dev/null || true
-}
-
-stop_spinner() {
-    local msg="$1"
-    if [ -n "$spinner_pid" ]; then
-        kill "$spinner_pid" 2>/dev/null || true
-        wait "$spinner_pid" 2>/dev/null || true
-        spinner_pid=""
-    fi
-    printf "\r  [OK]  %-60s\n" "$msg"
-}
-
-run_quietly() {
-    local msg="$1"
-    shift
-    start_spinner "$msg"
-    if "$@" >/tmp/setup_last_output.log 2>&1; then
-        stop_spinner "$msg -- Done"
-    else
-        stop_spinner "$msg -- FAILED"
-        print_error "Command failed: $*"
-        print_info  "Check /tmp/setup_last_output.log for details"
-        cat /tmp/setup_last_output.log
-        exit 1
-    fi
-}
-
-# --- DNS Check ---------------------------------------------------------------
-check_dns() {
-    local subdomain="$1"
-    local expected_ip="$2"
-    local resolved_ip
-    resolved_ip=$(dig +short "$subdomain" 2>/dev/null | tail -n1 || true)
-    [ "$resolved_ip" = "$expected_ip" ]
-}
-
-# =============================================================================
-#   PHASE 0: Root Guard & Banner
-# =============================================================================
-print_banner
-check_root
-
-# =============================================================================
-#   PHASE 0: Welcome & Pre-flight Checklist
-# =============================================================================
-print_phase "PHASE 0 -- Welcome & Pre-flight Checklist"
-
-echo -e "  Welcome, Trainee! This script will fully automate your VPS environment"
-echo -e "  setup for the ${BOLD}Agentic AI Bootcamp${RESET}. Please read the following carefully:"
-echo ""
-echo -e "  ${BOLD}What this script will install and configure:${RESET}"
-echo -e "  ${DIM}  [1] System update & UFW firewall hardening"
-echo -e "      [2] Docker & Docker Compose (via official get.docker.com)"
-echo -e "      [3] n8n workflow automation (via Docker)"
-echo -e "      [4] OpenClaw AI integration (your chosen model + API key)"
-echo -e "      [5] Nginx as a reverse proxy for n8n"
-echo -e "      [6] Free SSL/TLS certificate via Let's Encrypt (Certbot)${RESET}"
-echo ""
-
-print_warn "BEFORE you continue, confirm ALL of the following are done:"
-separator
-echo ""
-echo -e "  [ ] 1. VPS is freshly provisioned with Ubuntu 22.04 or 24.04"
-echo -e "  [ ] 2. A domain name has been purchased"
-echo -e "  [ ] 3. DNS A Record configured:"
-echo -e "         Type: A  |  Name: n8n  |  Content: [Your VPS IP]"
-echo -e "         (This creates n8n.yourdomain.com)"
-echo -e "  [ ] 4. DNS propagation has been waited for (5-30 minutes)"
-echo -e "  [ ] 5. API Key is ready for your chosen AI model (Gemini, OpenAI, or Claude)"
-echo ""
-separator
-echo ""
-
-if ! confirm "I have completed all the items above and I'm ready to proceed"; then
+choose() {
+    # choose VAR "Prompt" "opt1" "opt2" ...
+    local __var="$1" prompt="$2"; shift 2
+    local opts=("$@") i choice
     echo ""
-    print_info "Setup cancelled. Complete the pre-flight checklist and re-run the script."
-    exit 0
+    for i in "${!opts[@]}"; do
+        printf "     ${BOLD}%d${RESET}) %s\n" "$((i + 1))" "${opts[$i]}"
+    done
+    echo ""
+    while :; do
+        read -rp "  ${CYAN}?${RESET} ${prompt} [1-${#opts[@]}]: " choice || true
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#opts[@]}" ]; then
+            printf -v "$__var" '%s' "$choice"
+            return
+        fi
+        print_warn "Enter a number between 1 and ${#opts[@]}."
+    done
+}
+
+# --- Command runner with spinner --------------------------------------------
+_spin_pid=""
+_spin_stop() {
+    if [ -n "$_spin_pid" ]; then
+        kill "$_spin_pid" 2>/dev/null || true
+        wait "$_spin_pid" 2>/dev/null || true
+        _spin_pid=""
+    fi
+}
+trap '_spin_stop' EXIT
+
+run_step() {
+    # run_step "Message" cmd args...
+    local msg="$1"; shift
+    if [ -t 1 ]; then
+        (
+            local chars='|/-\' i=0
+            while :; do
+                printf "\r  ${BLUE}%s${RESET} %s " "${chars:$((i % 4)):1}" "$msg"
+                sleep 0.15
+                i=$(( (i + 1) % 4 ))
+            done
+        ) &
+        _spin_pid=$!
+    else
+        printf "  > %s\n" "$msg"
+    fi
+
+    local rc=0
+    "$@" >/tmp/agentic_last.log 2>&1 || rc=$?
+    _spin_stop
+    [ -t 1 ] && printf "\r\033[K"
+
+    if [ "$rc" -eq 0 ]; then
+        print_ok "$msg"
+        _log "CMD OK: $*"
+        return 0
+    fi
+    print_error "$msg"
+    _log "CMD FAIL ($rc): $*"
+    echo ""
+    tail -n 30 /tmp/agentic_last.log
+    echo ""
+    die "Step failed: ${msg}"
+}
+
+run_soft() {
+    # Same as run_step but never aborts the script.
+    local msg="$1"; shift
+    local rc=0
+    "$@" >/tmp/agentic_last.log 2>&1 || rc=$?
+    if [ "$rc" -eq 0 ]; then print_ok "$msg"; return 0; fi
+    print_warn "${msg} - skipped (non-fatal)"
+    _log "SOFT FAIL ($rc): $*"
+    return 1
+}
+
+command_exists() { command -v "$1" >/dev/null 2>&1; }
+
+# =============================================================================
+#   PRE-FLIGHT
+# =============================================================================
+clear
+echo "${CYAN}${BOLD}"
+cat <<'BANNER'
+  +==================================================================+
+  |            CODED - Agentic AI Bootcamp VPS Setup                 |
+  |          n8n  +  OpenClaw  +  Nginx  +  Free SSL                 |
+  +==================================================================+
+BANNER
+echo "${RESET}"
+echo "  ${DIM}version ${SCRIPT_VERSION}${RESET}"
+echo ""
+
+if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+    print_error "This script must run as root."
+    print_info  "Run:  sudo bash $0"
+    exit 1
+fi
+
+touch "$LOG_FILE" 2>/dev/null || LOG_FILE="/tmp/agentic-setup.log"
+chmod 600 "$LOG_FILE" 2>/dev/null || true
+_log "=== Setup started (v${SCRIPT_VERSION}) ==="
+
+# OS sanity check
+if [ -r /etc/os-release ]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    if [ "${ID:-}" != "ubuntu" ] && [[ "${ID_LIKE:-}" != *debian* ]]; then
+        print_warn "This script targets Ubuntu. Detected: ${PRETTY_NAME:-unknown}"
+        confirm "Continue anyway?" || exit 0
+    else
+        print_ok "Operating system: ${PRETTY_NAME:-Ubuntu}"
+    fi
+fi
+
+# Architecture check
+ARCH="$(uname -m)"
+case "$ARCH" in
+    x86_64|aarch64|arm64) print_ok "Architecture: ${ARCH}" ;;
+    *) print_warn "Unusual architecture '${ARCH}'. Docker images may not be available." ;;
+esac
+
+# Resource check
+TOTAL_RAM_MB=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
+CPU_CORES=$(nproc)
+DISK_FREE_GB=$(df -BG --output=avail / | tail -n1 | tr -dc '0-9')
+print_ok "Resources: ${CPU_CORES} vCPU, ${TOTAL_RAM_MB} MB RAM, ${DISK_FREE_GB} GB free disk"
+
+if [ "$TOTAL_RAM_MB" -lt 3500 ]; then
+    print_warn "Less than 4 GB RAM detected. n8n + OpenClaw will be slow."
+    print_info "A swap file will be created to keep the stack stable."
+fi
+if [ "$DISK_FREE_GB" -lt 10 ]; then
+    print_warn "Less than 10 GB free disk. Docker images need roughly 5 GB."
 fi
 
 # =============================================================================
-#   PHASE 1: Configuration Wizard — Gather All Inputs
+#   PHASE 1 - Configuration
 # =============================================================================
-print_phase "PHASE 1 -- Configuration Wizard"
+print_phase "PHASE 1 / 9  --  Configuration"
 
-echo -e "  ${BOLD}Let's collect your setup details before installing anything.${RESET}"
-echo -e "  ${DIM}You can review everything before installation begins.${RESET}"
-echo ""
+# Reload previous answers when re-running.
+REUSE_CONFIG=false
+if [ -f "$CONF_FILE" ]; then
+    print_info "A previous setup was found on this server."
+    if confirm "Re-use the previous answers (domain, email, timezone)?"; then
+        # shellcheck disable=SC1090
+        . "$CONF_FILE"
+        REUSE_CONFIG=true
+        print_ok "Loaded previous configuration from ${CONF_FILE}"
+    fi
+fi
 
-# 1.1 VPS IP
-ask VPS_IP "Enter your VPS Public IP Address (e.g., 1.2.3.4)"
+# --- Public IP ---
+DETECTED_IP="$(curl -4 -fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)"
+[ -z "$DETECTED_IP" ] && DETECTED_IP="$(curl -4 -fsS --max-time 8 https://ifconfig.me 2>/dev/null || true)"
+[ -z "$DETECTED_IP" ] && DETECTED_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 
-# 1.2 Domain
-ask DOMAIN "Enter your root domain name (e.g., my-agent-platform.com)"
-N8N_SUBDOMAIN="n8n.${DOMAIN}"
-echo ""
-print_info "Your n8n instance will be at: https://${N8N_SUBDOMAIN}"
-
-# 1.3 Email for Certbot
-ask CERTBOT_EMAIL "Enter your email address (for Let's Encrypt SSL alerts)"
-
-# 1.4 n8n Admin Credentials
-echo ""
-separator
-echo ""
-echo -e "  ${BOLD}n8n Admin Account${RESET}"
-print_info "These credentials will be used to log into your n8n dashboard."
-ask    N8N_USER "n8n admin username" "admin"
-ask_secret N8N_PASS "n8n admin password (min 8 characters)"
-while [ "${#N8N_PASS}" -lt 8 ]; do
-    print_warn "Password must be at least 8 characters. Try again."
-    ask_secret N8N_PASS "n8n admin password (min 8 characters)"
-done
-
-# 1.5 AI Model Selection
-echo ""
-separator
-echo ""
-echo -e "  ${BOLD}OpenClaw AI Model Selection${RESET}"
-echo ""
-echo "  Select the AI provider for OpenClaw:"
-echo ""
-echo "  [1] Google Gemini  (recommended - Free tier available)"
-echo "  [2] OpenAI (GPT-4o, GPT-4.1, etc.)"
-echo "  [3] Anthropic Claude (Claude Sonnet 4, Opus, etc.)"
-echo ""
-
-AI_CHOICE=""
-while [[ ! "$AI_CHOICE" =~ ^[1-3]$ ]]; do
-    read -rp "  [?] Enter your choice [1, 2, or 3]: " AI_CHOICE
-    [[ ! "$AI_CHOICE" =~ ^[1-3]$ ]] && print_warn "Invalid choice. Please enter 1, 2, or 3."
-done
-
-if [ "$AI_CHOICE" = "1" ]; then
-    AI_PROVIDER="gemini"
-    AI_LABEL="Google Gemini"
-    echo ""
-    echo -e "  ${BOLD}Available Gemini Models:${RESET}"
-    echo "  [1] gemini-2.0-flash           (fast, efficient - RECOMMENDED)"
-    echo "  [2] gemini-2.0-flash-thinking  (reasoning tasks)"
-    echo "  [3] gemini-1.5-pro             (1M token context window)"
-    echo "  [4] gemini-1.5-flash           (fast and cost-effective)"
-    echo ""
-    MODEL_CHOICE=""
-    while [[ ! "$MODEL_CHOICE" =~ ^[1-4]$ ]]; do
-        read -rp "  [?] Select Gemini model [1-4]: " MODEL_CHOICE
-        [[ ! "$MODEL_CHOICE" =~ ^[1-4]$ ]] && print_warn "Please enter 1, 2, 3, or 4."
-    done
-    case "$MODEL_CHOICE" in
-        1) AI_MODEL="gemini-2.0-flash" ;;
-        2) AI_MODEL="gemini-2.0-flash-thinking-exp" ;;
-        3) AI_MODEL="gemini-1.5-pro" ;;
-        4) AI_MODEL="gemini-1.5-flash" ;;
-    esac
-    API_KEY_LABEL="Gemini API Key (get it from: https://aistudio.google.com/app/apikey)"
-    API_KEY_ENV="GEMINI_API_KEY"
-elif [ "$AI_CHOICE" = "2" ]; then
-    AI_PROVIDER="openai"
-    AI_LABEL="OpenAI"
-    echo ""
-    echo -e "  ${BOLD}Available OpenAI Models:${RESET}"
-    echo "  [1] gpt-4o-mini  (fast, affordable - RECOMMENDED for Bootcamp)"
-    echo "  [2] gpt-4o       (most capable multimodal model)"
-    echo "  [3] gpt-4.1      (long context, great for agents)"
-    echo "  [4] gpt-4.1-mini (efficient, cost-optimized)"
-    echo "  [5] o4-mini      (reasoning model, complex tasks)"
-    echo ""
-    MODEL_CHOICE=""
-    while [[ ! "$MODEL_CHOICE" =~ ^[1-5]$ ]]; do
-        read -rp "  [?] Select OpenAI model [1-5]: " MODEL_CHOICE
-        [[ ! "$MODEL_CHOICE" =~ ^[1-5]$ ]] && print_warn "Please enter a number between 1 and 5."
-    done
-    case "$MODEL_CHOICE" in
-        1) AI_MODEL="gpt-4o-mini" ;;
-        2) AI_MODEL="gpt-4o" ;;
-        3) AI_MODEL="gpt-4.1" ;;
-        4) AI_MODEL="gpt-4.1-mini" ;;
-        5) AI_MODEL="o4-mini" ;;
-    esac
-    API_KEY_LABEL="OpenAI API Key (get it from: https://platform.openai.com/api-keys)"
-    API_KEY_ENV="OPENAI_API_KEY"
+if [ -n "$DETECTED_IP" ]; then
+    print_ok "Detected public IP: ${BOLD}${DETECTED_IP}${RESET}"
+    VPS_IP="$DETECTED_IP"
 else
-    AI_PROVIDER="anthropic"
-    AI_LABEL="Anthropic Claude"
-    echo ""
-    echo -e "  ${BOLD}Available Claude Models:${RESET}"
-    echo "  [1] claude-sonnet-4-20250514   (balanced power + speed - RECOMMENDED)"
-    echo "  [2] claude-4-opus-20250514     (highest capability, complex tasks)"
-    echo "  [3] claude-3.5-haiku           (fast, cost-effective)"
-    echo "  [4] claude-3.5-sonnet          (strong all-rounder)"
-    echo ""
-    MODEL_CHOICE=""
-    while [[ ! "$MODEL_CHOICE" =~ ^[1-4]$ ]]; do
-        read -rp "  [?] Select Claude model [1-4]: " MODEL_CHOICE
-        [[ ! "$MODEL_CHOICE" =~ ^[1-4]$ ]] && print_warn "Please enter 1, 2, 3, or 4."
+    ask VPS_IP "Enter your VPS public IP address"
+fi
+
+# --- Domain ---
+if [ "$REUSE_CONFIG" = false ] || [ -z "${DOMAIN:-}" ]; then
+    while :; do
+        ask DOMAIN "Enter your root domain (example: my-agent.com)"
+        DOMAIN="${DOMAIN#http://}"; DOMAIN="${DOMAIN#https://}"; DOMAIN="${DOMAIN%%/*}"
+        DOMAIN="$(echo "$DOMAIN" | tr '[:upper:]' '[:lower:]')"
+        if [[ "$DOMAIN" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]; then
+            break
+        fi
+        print_warn "That does not look like a domain. Enter it without http:// and without a subdomain."
     done
-    case "$MODEL_CHOICE" in
-        1) AI_MODEL="claude-sonnet-4-20250514" ;;
-        2) AI_MODEL="claude-4-opus-20250514" ;;
-        3) AI_MODEL="claude-3-5-haiku-20241022" ;;
-        4) AI_MODEL="claude-3-5-sonnet-20241022" ;;
-    esac
-    API_KEY_LABEL="Anthropic API Key (get it from: https://console.anthropic.com/settings/keys)"
-    API_KEY_ENV="ANTHROPIC_API_KEY"
 fi
 
-echo ""
-ask_secret AI_API_KEY "$API_KEY_LABEL"
+N8N_HOSTNAME="n8n.${DOMAIN}"
+CLAW_HOSTNAME="claw.${DOMAIN}"
 
-# 1.6 Confirm Summary
 echo ""
-print_phase "Configuration Summary -- Please Review Before Starting"
-
-echo -e "  ${BOLD}VPS Public IP:   ${RESET} ${CYAN}${VPS_IP}${RESET}"
-echo -e "  ${BOLD}Root Domain:     ${RESET} ${CYAN}${DOMAIN}${RESET}"
-echo -e "  ${BOLD}n8n URL:         ${RESET} ${CYAN}https://${N8N_SUBDOMAIN}${RESET}"
-echo -e "  ${BOLD}Certbot Email:   ${RESET} ${CYAN}${CERTBOT_EMAIL}${RESET}"
-echo -e "  ${BOLD}n8n Username:    ${RESET} ${CYAN}${N8N_USER}${RESET}"
-echo -e "  ${BOLD}n8n Password:    ${RESET} ${DIM}[hidden]${RESET}"
-echo -e "  ${BOLD}AI Provider:     ${RESET} ${CYAN}${AI_LABEL}${RESET}"
-echo -e "  ${BOLD}AI Model:        ${RESET} ${CYAN}${AI_MODEL}${RESET}"
-echo -e "  ${BOLD}API Key:         ${RESET} ${DIM}[hidden -- ${#AI_API_KEY} characters]${RESET}"
+print_info "n8n will live at             https://${N8N_HOSTNAME}"
+print_info "OpenClaw dashboard will be   https://${CLAW_HOSTNAME}"
+echo ""
+echo "  ${BOLD}${YELLOW}You need TWO DNS 'A' records at your domain provider:${RESET}"
+echo ""
+echo "     Type: A   Name: ${BOLD}n8n${RESET}    Value: ${BOLD}${VPS_IP}${RESET}   TTL: lowest available"
+echo "     Type: A   Name: ${BOLD}claw${RESET}   Value: ${BOLD}${VPS_IP}${RESET}   TTL: lowest available"
+echo ""
+print_info "If you already added only 'n8n', add 'claw' now - the script will wait for it."
+print_info "Also delete any AAAA (IPv6) records on those names - they break SSL here."
 echo ""
 
-if ! confirm "Everything looks correct. Start the automated setup now?"; then
-    print_info "Setup cancelled. Re-run the script to start over."
-    exit 0
+# --- Email ---
+if [ "$REUSE_CONFIG" = false ] || [ -z "${CERTBOT_EMAIL:-}" ]; then
+    while :; do
+        ask CERTBOT_EMAIL "Your email address (Let's Encrypt expiry alerts)"
+        [[ "$CERTBOT_EMAIL" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[a-zA-Z]{2,}$ ]] && break
+        print_warn "That does not look like a valid email address."
+    done
 fi
 
-# =============================================================================
-#   DNS Propagation Check
-# =============================================================================
-print_phase "DNS Verification"
+# --- Timezone ---
+if [ "$REUSE_CONFIG" = false ] || [ -z "${TIMEZONE:-}" ]; then
+    ask TIMEZONE "Your timezone (used by n8n schedules)" "Asia/Kuwait"
+    if [ ! -f "/usr/share/zoneinfo/${TIMEZONE}" ]; then
+        print_warn "Unknown timezone '${TIMEZONE}'. Falling back to UTC."
+        TIMEZONE="UTC"
+    fi
+fi
 
-print_step "Checking if ${N8N_SUBDOMAIN} resolves to ${VPS_IP} ..."
+# --- OpenClaw dashboard password (the gateway token) -------------------------
+# The trainee chooses this so they can remember it. It guards a dashboard that
+# is reachable from the public internet, so it is checked like a password:
+# 12 characters minimum, typed twice, obvious choices rejected.
+echo ""
+separator
+echo ""
+echo "  ${BOLD}OpenClaw dashboard password${RESET}"
+print_info "You will type this into https://${CLAW_HOSTNAME} to open your dashboard."
+print_info "OpenClaw calls it the 'gateway token'. Choose something you will remember."
+print_warn "This dashboard is reachable from the internet - do not use a short or obvious password."
+echo ""
 
-if command_exists dig; then
-    if check_dns "$N8N_SUBDOMAIN" "$VPS_IP"; then
-        print_ok "DNS is correctly pointing ${N8N_SUBDOMAIN} -> ${VPS_IP}"
-    else
-        RESOLVED=$(dig +short "$N8N_SUBDOMAIN" 2>/dev/null | tail -n1 || echo "not resolved")
-        print_warn "DNS resolved to: ${RESOLVED}"
-        print_warn "Expected:        ${VPS_IP}"
-        echo ""
-        print_info "DNS propagation can take 5-30 minutes."
-        print_info "SSL certificate issuance will FAIL if DNS is not propagated."
-        echo ""
-        if ! confirm "Continue anyway? (SSL cert may fail if DNS is not ready)"; then
-            print_info "Good call. Wait for DNS propagation and re-run the script."
-            exit 0
+EXISTING_TOKEN=""
+if [ -f "${DEPLOY_DIR}/stack.env" ]; then
+    EXISTING_TOKEN="$(grep -m1 '^OPENCLAW_GATEWAY_TOKEN=' "${DEPLOY_DIR}/stack.env" 2>/dev/null | cut -d= -f2- || true)"
+fi
+
+KEEP_TOKEN=false
+if [ -n "$EXISTING_TOKEN" ]; then
+    print_info "This server already has a dashboard password set."
+    confirm "Keep the existing password?" && KEEP_TOKEN=true
+fi
+
+if [ "$KEEP_TOKEN" = true ]; then
+    OPENCLAW_GATEWAY_TOKEN="$EXISTING_TOKEN"
+    print_ok "Keeping your existing dashboard password"
+else
+    print_info "Allowed: letters, numbers and symbols such as ! @ # - _ . +"
+    print_info "Not allowed: spaces, \$, quotes and backslashes (they break config files)."
+    echo ""
+    # Held in a variable: an inline regex containing ';' breaks [[ ]] parsing.
+    TOKEN_RE='^[A-Za-z0-9@#%^*()_+=~,.?!:/-]+$'
+    while :; do
+        ask_secret OPENCLAW_GATEWAY_TOKEN "Choose your dashboard password (12+ characters)" 12
+
+        if [[ ! "$OPENCLAW_GATEWAY_TOKEN" =~ $TOKEN_RE ]]; then
+            print_warn "That contains a character we cannot use safely. Avoid spaces, \$, quotes and backslashes."
+            continue
+        fi
+        case "${OPENCLAW_GATEWAY_TOKEN,,}" in
+            password*|12345678*|qwerty*|openclaw*|changeme*|admin*|letmein*)
+                print_warn "That password is too easy to guess. Pick another one."
+                continue ;;
+        esac
+
+        ask_secret TOKEN_CONFIRM "Type it once more to confirm" 12
+        if [ "$OPENCLAW_GATEWAY_TOKEN" = "$TOKEN_CONFIRM" ]; then
+            unset TOKEN_CONFIRM
+            print_ok "Dashboard password set (${#OPENCLAW_GATEWAY_TOKEN} characters)"
+            break
+        fi
+        print_warn "The two entries do not match. Try again."
+    done
+fi
+
+# --- AI provider ---
+echo ""
+separator
+echo ""
+echo "  ${BOLD}Which AI provider should OpenClaw use?${RESET}"
+choose AI_CHOICE "Select provider" \
+    "Anthropic Claude   (recommended for this bootcamp)" \
+    "OpenAI             (GPT models)" \
+    "Google Gemini      (has a free tier)"
+
+case "$AI_CHOICE" in
+    1) AI_PROVIDER="anthropic"
+       AI_LABEL="Anthropic Claude"
+       API_KEY_ENV="ANTHROPIC_API_KEY"
+       AI_MODEL_DEFAULT="anthropic/claude-sonnet-4-6"
+       KEY_URL="https://console.anthropic.com/settings/keys" ;;
+    2) AI_PROVIDER="openai"
+       AI_LABEL="OpenAI"
+       API_KEY_ENV="OPENAI_API_KEY"
+       AI_MODEL_DEFAULT="openai/gpt-5.6"
+       KEY_URL="https://platform.openai.com/api-keys" ;;
+    3) AI_PROVIDER="google"
+       AI_LABEL="Google Gemini"
+       API_KEY_ENV="GEMINI_API_KEY"
+       AI_MODEL_DEFAULT=""
+       KEY_URL="https://aistudio.google.com/app/apikey" ;;
+esac
+
+echo ""
+print_info "Get your key here: ${KEY_URL}"
+print_info "The key is hidden while you type or paste it. Paste, then press Enter."
+ask_secret AI_API_KEY "${AI_LABEL} API key" 8
+
+# The exact model is chosen later from the live list OpenClaw reports,
+# so this script never hard-codes model names that go stale.
+
+# --- Summary ---
+echo ""
+print_phase "Review your settings"
+printf "  %-22s %s\n" "VPS IP:"        "${CYAN}${VPS_IP}${RESET}"
+printf "  %-22s %s\n" "Root domain:"   "${CYAN}${DOMAIN}${RESET}"
+printf "  %-22s %s\n" "n8n URL:"       "${CYAN}https://${N8N_HOSTNAME}${RESET}"
+printf "  %-22s %s\n" "OpenClaw URL:"  "${CYAN}https://${CLAW_HOSTNAME}${RESET}"
+printf "  %-22s %s\n" "SSL email:"     "${CYAN}${CERTBOT_EMAIL}${RESET}"
+printf "  %-22s %s\n" "Timezone:"      "${CYAN}${TIMEZONE}${RESET}"
+printf "  %-22s %s\n" "AI provider:"   "${CYAN}${AI_LABEL}${RESET}"
+printf "  %-22s %s\n" "API key:"       "${DIM}hidden (${#AI_API_KEY} characters)${RESET}"
+printf "  %-22s %s\n" "Dashboard pass:" "${DIM}hidden (${#OPENCLAW_GATEWAY_TOKEN} characters) - the one you chose${RESET}"
+echo ""
+print_info "You will create your n8n account in the browser after setup - n8n handles that itself now."
+echo ""
+confirm "Start the installation?" || { print_info "Cancelled. Nothing was changed."; exit 0; }
+
+# Persist non-secret answers for re-runs.
+umask 077
+cat >"$CONF_FILE" <<EOF
+# Written by vps_setup.sh v${SCRIPT_VERSION} on $(date -Is)
+DOMAIN="${DOMAIN}"
+N8N_HOSTNAME="${N8N_HOSTNAME}"
+CLAW_HOSTNAME="${CLAW_HOSTNAME}"
+CERTBOT_EMAIL="${CERTBOT_EMAIL}"
+TIMEZONE="${TIMEZONE}"
+VPS_IP="${VPS_IP}"
+DEPLOY_DIR="${DEPLOY_DIR}"
+EOF
+chmod 600 "$CONF_FILE"
+umask 022   # restore: later steps create directories Nginx and Docker must read
+
+# =============================================================================
+#   PHASE 2 - Base system, swap, firewall
+# =============================================================================
+print_phase "PHASE 2 / 9  --  System, swap and firewall"
+
+APT_OPTS=(-y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+
+run_step "Refreshing package lists"        apt-get update
+run_step "Installing base tools"           apt-get install "${APT_OPTS[@]}" \
+    curl wget ca-certificates gnupg lsb-release ufw dnsutils jq openssl \
+    apt-transport-https software-properties-common
+
+# Upgrade is slow and rarely required for a fresh VPS; make it opt-in but default yes.
+if confirm "Install pending security updates now? (recommended, adds 1-3 minutes)"; then
+    run_step "Upgrading installed packages" apt-get upgrade "${APT_OPTS[@]}"
+fi
+
+# --- Timezone ---
+run_soft "Setting system timezone to ${TIMEZONE}" timedatectl set-timezone "$TIMEZONE" || true
+
+# --- Swap: the single biggest cause of a "laggy" 4 GB VPS ---
+print_step "Checking swap space ..."
+CURRENT_SWAP_MB=$(awk '/SwapTotal/{print int($2/1024)}' /proc/meminfo)
+if [ "$CURRENT_SWAP_MB" -ge 1024 ]; then
+    print_ok "Swap already configured (${CURRENT_SWAP_MB} MB)"
+elif [ "$DISK_FREE_GB" -lt 8 ]; then
+    print_warn "Not enough free disk to create swap safely. Skipping."
+else
+    SWAP_GB=2
+    [ "$TOTAL_RAM_MB" -lt 2500 ] && SWAP_GB=4
+    SWAP_MADE=true
+    if [ ! -f /swapfile ]; then
+        # fallocate is instant but unsupported on some filesystems; dd always works.
+        if ! run_soft "Creating ${SWAP_GB} GB swap file" fallocate -l "${SWAP_GB}G" /swapfile; then
+            run_soft "Creating ${SWAP_GB} GB swap file (slow method)" \
+                dd if=/dev/zero of=/swapfile bs=1M count=$((SWAP_GB * 1024)) status=none || SWAP_MADE=false
+        fi
+        if [ "$SWAP_MADE" = true ]; then
+            chmod 600 /swapfile
+            run_soft "Formatting swap file" mkswap /swapfile || SWAP_MADE=false
         fi
     fi
-else
-    print_warn "'dig' not installed. Skipping DNS check."
-    print_warn "Make sure your A record is configured before running this script."
+    if [ "$SWAP_MADE" = true ] && run_soft "Activating swap" swapon /swapfile; then
+        grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >>/etc/fstab
+        sysctl -qw vm.swappiness=10 >/dev/null 2>&1 || true
+        grep -q '^vm.swappiness' /etc/sysctl.conf || echo 'vm.swappiness=10' >>/etc/sysctl.conf
+        print_ok "Swap active (${SWAP_GB} GB, swappiness=10)"
+    else
+        rm -f /swapfile
+        print_warn "Could not create swap. The stack will still run but may be slower."
+    fi
 fi
 
-# =============================================================================
-#   PHASE 2: System Update & Firewall Hardening
-# =============================================================================
-print_phase "PHASE 2 -- System Update & Firewall Hardening"
-
-run_quietly "Updating package lists" apt-get update
-run_quietly "Upgrading installed packages" apt-get upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
-run_quietly "Installing essential tools" apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" curl wget gnupg2 ca-certificates lsb-release ufw dnsutils
-
+# --- Firewall (detect the real SSH port so nobody gets locked out) ---
 print_step "Configuring UFW firewall ..."
-ufw --force reset        >/dev/null 2>&1
+SSH_PORTS="$(sshd -T 2>/dev/null | awk '/^port /{print $2}' | sort -u || true)"
+[ -z "$SSH_PORTS" ] && SSH_PORTS="$(awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/{print $2}' /etc/ssh/sshd_config 2>/dev/null | sort -u || true)"
+[ -z "$SSH_PORTS" ] && SSH_PORTS="22"
+
+ufw --force reset          >/dev/null 2>&1
 ufw default deny incoming  >/dev/null 2>&1
 ufw default allow outgoing >/dev/null 2>&1
-ufw allow OpenSSH          >/dev/null 2>&1
-ufw allow 80/tcp           >/dev/null 2>&1
-ufw allow 443/tcp          >/dev/null 2>&1
-ufw --force enable         >/dev/null 2>&1
-print_ok "Firewall configured: SSH and Nginx (80/443) are allowed"
+for p in $SSH_PORTS; do
+    ufw allow "${p}/tcp" >/dev/null 2>&1
+    print_info "Allowed SSH on port ${p}"
+done
+ufw allow 80/tcp   >/dev/null 2>&1
+ufw allow 443/tcp  >/dev/null 2>&1
+ufw --force enable >/dev/null 2>&1
+print_ok "Firewall active: SSH (${SSH_PORTS// /, }), HTTP 80, HTTPS 443"
+print_info "Ports ${N8N_PORT} and ${OPENCLAW_PORT} stay closed - both apps are reachable only through Nginx."
 
 # =============================================================================
-#   PHASE 3: Docker & Docker Compose
+#   PHASE 3 - DNS verification (waits instead of failing)
 # =============================================================================
-print_phase "PHASE 3 -- Docker & Docker Compose Installation"
+print_phase "PHASE 3 / 9  --  DNS verification"
 
-if command_exists docker; then
-    DOCKER_VER=$(docker --version)
-    print_ok "Docker already installed: ${DOCKER_VER}"
+# Note the trailing '|| true': under `set -o pipefail` a non-matching grep
+# would otherwise make the whole assignment fail and abort the script.
+resolve_a()    { dig +short A    "$1" @1.1.1.1 2>/dev/null | grep -Eo '^[0-9]+(\.[0-9]+){3}$' | tail -n1 || true; }
+resolve_aaaa() { dig +short AAAA "$1" @1.1.1.1 2>/dev/null | grep -E ':'                      | tail -n1 || true; }
+
+dns_ready() {
+    local host="$1" got=""
+    got="$(resolve_a "$host")" || true
+    [ -n "$got" ] && [ "$got" = "$VPS_IP" ]
+}
+
+HOST_HAS_IPV6=false
+if [ -f /proc/net/if_inet6 ] && ip -6 addr show scope global 2>/dev/null | grep -q 'inet6'; then
+    HOST_HAS_IPV6=true
+fi
+
+wait_for_dns() {
+    local host="$1" tries=0 max=40 got=""
+    while [ "$tries" -lt "$max" ]; do
+        if dns_ready "$host"; then
+            print_ok "${host} -> ${VPS_IP}"
+            return 0
+        fi
+        got="$(resolve_a "$host")" || true
+        if [ "$tries" -eq 0 ]; then
+            print_warn "${host} resolves to '${got:-nothing}' but should be ${VPS_IP}"
+            print_info "Waiting for DNS to propagate. This takes 1-30 minutes."
+            print_info "Press Ctrl+C to abort, fix the DNS record, and re-run this script."
+        fi
+        printf "\r  ${DIM}waiting for %s ... %d/%d${RESET}   " "$host" "$((tries + 1))" "$max"
+        sleep 15
+        tries=$((tries + 1))
+    done
+    printf "\r\033[K"
+    return 1
+}
+
+DNS_ALL_OK=true
+for host in "$N8N_HOSTNAME" "$CLAW_HOSTNAME"; do
+    if ! wait_for_dns "$host"; then
+        print_error "${host} still does not point to ${VPS_IP}"
+        DNS_ALL_OK=false
+    fi
+    # An AAAA record on a server without working IPv6 makes Let's Encrypt fail:
+    # the CA prefers IPv6 and never falls back to IPv4.
+    v6="$(resolve_aaaa "$host")" || true
+    if [ -n "$v6" ] && [ "$HOST_HAS_IPV6" = false ]; then
+        print_error "${host} has an AAAA (IPv6) record: ${v6}"
+        print_warn  "This server has no IPv6, so Let's Encrypt will try IPv6 first and fail."
+        print_warn  "DELETE the AAAA record for '${host%%.*}' at your domain provider, then re-run."
+        DNS_ALL_OK=false
+    fi
+done
+
+if [ "$DNS_ALL_OK" = false ]; then
+    echo ""
+    print_warn "DNS is not fully ready. SSL certificates will fail."
+    print_info "The rest of the setup will still run; you can issue SSL later with:  agentic ssl"
+    echo ""
+    confirm "Continue without valid DNS?" || { print_info "Fix the DNS records and re-run this script."; exit 0; }
+fi
+
+# =============================================================================
+#   PHASE 4 - Docker
+# =============================================================================
+print_phase "PHASE 4 / 9  --  Docker Engine"
+
+if command_exists docker && docker compose version >/dev/null 2>&1; then
+    print_ok "Docker already installed: $(docker --version | cut -d, -f1)"
 else
-    run_quietly "Downloading official Docker install script" \
-        curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
-    run_quietly "Installing Docker (this may take a minute)" \
-        sh /tmp/get-docker.sh
+    run_step "Downloading Docker installer" curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
+    run_step "Installing Docker Engine (takes 1-2 minutes)" sh /tmp/get-docker.sh
     rm -f /tmp/get-docker.sh
-    print_ok "Docker installed successfully"
 fi
 
-run_quietly "Enabling Docker service on boot" systemctl enable --now docker
-print_ok "Docker service is active"
+run_step "Enabling Docker at boot" systemctl enable --now docker
 
-DOCKER_COMPOSE_VER=$(docker compose version 2>/dev/null || echo "")
-if [ -n "$DOCKER_COMPOSE_VER" ]; then
-    print_ok "Docker Compose plugin: ${DOCKER_COMPOSE_VER}"
-else
-    run_quietly "Installing docker-compose-plugin" apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" docker-compose-plugin
-    print_ok "Docker Compose plugin installed"
+if ! docker compose version >/dev/null 2>&1; then
+    run_step "Installing Docker Compose plugin" apt-get install "${APT_OPTS[@]}" docker-compose-plugin
+fi
+print_ok "Docker Compose: $(docker compose version --short 2>/dev/null || echo installed)"
+
+# Cap container log growth - unbounded JSON logs fill small VPS disks.
+if [ ! -f /etc/docker/daemon.json ]; then
+    mkdir -p /etc/docker
+    cat >/etc/docker/daemon.json <<'EOF'
+{
+  "log-driver": "json-file",
+  "log-opts": { "max-size": "10m", "max-file": "3" }
+}
+EOF
+    run_soft "Applying Docker log rotation" systemctl restart docker || true
 fi
 
 # =============================================================================
-#   PHASE 4: Deploy n8n & OpenClaw via Docker Compose
+#   PHASE 5 - Stack files
 # =============================================================================
-print_phase "PHASE 4 -- Deploying n8n & OpenClaw with Docker Compose"
+print_phase "PHASE 5 / 9  --  Writing the stack configuration"
 
-DEPLOY_DIR="/opt/agentic-stack"
-run_quietly "Creating deployment directory at ${DEPLOY_DIR}" mkdir -p "$DEPLOY_DIR"
+mkdir -p "$DEPLOY_DIR"/{openclaw,openclaw-workspace,openclaw-secrets}
+chmod 700 "$DEPLOY_DIR"
 
-print_step "Generating docker-compose.yml ..."
+# The OpenClaw container runs as uid/gid 1000 (user "node").
+chown -R 1000:1000 "$DEPLOY_DIR"/openclaw "$DEPLOY_DIR"/openclaw-workspace "$DEPLOY_DIR"/openclaw-secrets
 
-# Escape dollar signs for docker-compose (uses $$ for a literal $)
-SAFE_N8N_PASS="${N8N_PASS//\$/\$\$}"
-SAFE_AI_API_KEY="${AI_API_KEY//\$/\$\$}"
+# --- Secrets: generated once, reused on every re-run -------------------------
+load_or_create_secret() {
+    # load_or_create_secret VAR_NAME <generator>
+    local key="$1" gen="$2" existing=""
+    if [ -f "${DEPLOY_DIR}/stack.env" ]; then
+        existing="$(grep -m1 "^${key}=" "${DEPLOY_DIR}/stack.env" 2>/dev/null | cut -d= -f2- || true)"
+    fi
+    if [ -n "$existing" ]; then
+        printf '%s' "$existing"
+    else
+        eval "$gen"
+    fi
+}
 
-cat > "${DEPLOY_DIR}/docker-compose.yml" << ENDOFCOMPOSE
+# OPENCLAW_GATEWAY_TOKEN is the password the trainee chose in Phase 1.
+# The n8n encryption key is internal - it is generated once and never shown,
+# but it must survive re-runs or n8n loses access to its saved credentials.
+N8N_ENCRYPTION_KEY="$(load_or_create_secret N8N_ENCRYPTION_KEY "openssl rand -hex 24")"
+
+# Image tags: override before running, e.g. AGENTIC_N8N_TAG=1.130.0 bash vps_setup.sh
+N8N_TAG="${AGENTIC_N8N_TAG:-latest}"
+OPENCLAW_TAG="${AGENTIC_OPENCLAW_TAG:-latest}"
+
+# --- stack.env : read literally by Docker Compose, so no escaping traps ------
+print_step "Writing ${DEPLOY_DIR}/stack.env ..."
+cat >"${DEPLOY_DIR}/stack.env" <<EOF
+# Secrets for the Agentic AI stack. Keep this file private (chmod 600).
+# Values are read literally - do not add quotes.
+OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN}
+N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+${API_KEY_ENV}=${AI_API_KEY}
+EOF
+chmod 600 "${DEPLOY_DIR}/stack.env"
+print_ok "Secrets written (file is readable by root only)"
+
+# --- openclaw.json ----------------------------------------------------------
+print_step "Writing OpenClaw gateway configuration ..."
+OC_CONFIG="${DEPLOY_DIR}/openclaw/openclaw.json"
+if [ -f "$OC_CONFIG" ]; then
+    cp "$OC_CONFIG" "${OC_CONFIG}.bak.$(date +%s)"
+    print_info "Existing openclaw.json backed up"
+fi
+cat >"$OC_CONFIG" <<EOF
+{
+  "gateway": {
+    "mode": "local",
+    "port": ${OPENCLAW_PORT},
+    "bind": "lan",
+    "auth": {
+      "mode": "token"
+    },
+    "trustedProxies": ["${DOCKER_GW}", "127.0.0.1"],
+    "controlUi": {
+      "enabled": true,
+      "allowedOrigins": ["https://${CLAW_HOSTNAME}"]
+    }
+  }
+}
+EOF
+chown 1000:1000 "$OC_CONFIG"
+chmod 600 "$OC_CONFIG"
+print_ok "OpenClaw bound to LAN inside the container, token auth on, origin locked to https://${CLAW_HOSTNAME}"
+
+# --- docker-compose.yml -----------------------------------------------------
+print_step "Writing ${DEPLOY_DIR}/docker-compose.yml ..."
+
+# Give each service a heap ceiling so one runaway process cannot freeze the VPS.
+if   [ "$TOTAL_RAM_MB" -ge 7500 ]; then N8N_MEM=2048; OC_MEM=3072
+elif [ "$TOTAL_RAM_MB" -ge 3500 ]; then N8N_MEM=1024; OC_MEM=1536
+else                                    N8N_MEM=768;  OC_MEM=1024
+fi
+
+cat >"${DEPLOY_DIR}/docker-compose.yml" <<EOF
+# Generated by vps_setup.sh v${SCRIPT_VERSION} - safe to regenerate.
+# Both services listen on 127.0.0.1 only. Nginx is the only public entrance.
 
 services:
 
   n8n:
-    image: n8nio/n8n:latest
+    image: docker.n8n.io/n8nio/n8n:${N8N_TAG}
     container_name: n8n
     restart: unless-stopped
     ports:
-      - "127.0.0.1:5678:5678"
+      - "127.0.0.1:${N8N_PORT}:5678"
+    env_file:
+      - stack.env
     environment:
-      - N8N_HOST=${N8N_SUBDOMAIN}
-      - N8N_PORT=5678
-      - N8N_PROTOCOL=https
-      - WEBHOOK_URL=https://${N8N_SUBDOMAIN}/
-      - N8N_BASIC_AUTH_ACTIVE=true
-      - N8N_BASIC_AUTH_USER=${N8N_USER}
-      - N8N_BASIC_AUTH_PASSWORD=${SAFE_N8N_PASS}
-      - N8N_EDITOR_BASE_URL=https://${N8N_SUBDOMAIN}/
-      - GENERIC_TIMEZONE=UTC
-      - N8N_METRICS=false
+      N8N_HOST: ${N8N_HOSTNAME}
+      N8N_PORT: "5678"
+      N8N_PROTOCOL: https
+      N8N_EDITOR_BASE_URL: https://${N8N_HOSTNAME}
+      WEBHOOK_URL: https://${N8N_HOSTNAME}/
+      N8N_PROXY_HOPS: "1"
+      N8N_SECURE_COOKIE: "true"
+      N8N_RUNNERS_ENABLED: "true"
+      N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: "true"
+      N8N_DIAGNOSTICS_ENABLED: "false"
+      N8N_HIRING_BANNER_ENABLED: "false"
+      EXECUTIONS_DATA_PRUNE: "true"
+      EXECUTIONS_DATA_MAX_AGE: "336"
+      DB_SQLITE_POOL_SIZE: "5"
+      GENERIC_TIMEZONE: ${TIMEZONE}
+      TZ: ${TIMEZONE}
+      NODE_OPTIONS: --max-old-space-size=${N8N_MEM}
     volumes:
       - n8n_data:/home/node/.n8n
     networks:
       - agentic_net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:5678/healthz >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
 
-  openclaw:
-    image: openclaw/openclaw:latest
-    container_name: openclaw
+  openclaw-gateway:
+    image: ghcr.io/openclaw/openclaw:${OPENCLAW_TAG}
+    container_name: openclaw-gateway
     restart: unless-stopped
+    init: true
     ports:
-      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:${OPENCLAW_PORT}:${OPENCLAW_PORT}"
+    env_file:
+      - stack.env
     environment:
-      - AI_PROVIDER=${AI_PROVIDER}
-      - AI_MODEL=${AI_MODEL}
-      - ${API_KEY_ENV}=${SAFE_AI_API_KEY}
-      - NODE_ENV=production
+      HOME: /home/node
+      OPENCLAW_HOME: /home/node
+      OPENCLAW_STATE_DIR: /home/node/.openclaw
+      OPENCLAW_CONFIG_DIR: /home/node/.openclaw
+      OPENCLAW_CONFIG_PATH: /home/node/.openclaw/openclaw.json
+      OPENCLAW_WORKSPACE_DIR: /home/node/.openclaw/workspace
+      OPENCLAW_GATEWAY_BIND: lan
+      OPENCLAW_GATEWAY_PORT: "${OPENCLAW_PORT}"
+      OPENCLAW_GATEWAY_AUTH_MODE: token
+      OPENCLAW_GATEWAY_CONTROLUI_ALLOWEDORIGINS: https://${CLAW_HOSTNAME}
+      NODE_OPTIONS: --max-old-space-size=${OC_MEM}
+      TERM: xterm-256color
+      TZ: ${TIMEZONE}
     volumes:
-      - openclaw_data:/app/data
+      - ./openclaw:/home/node/.openclaw
+      - ./openclaw-workspace:/home/node/.openclaw/workspace
+      - ./openclaw-secrets:/home/node/.config/openclaw
+    cap_drop:
+      - NET_RAW
+      - NET_ADMIN
+    security_opt:
+      - no-new-privileges:true
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     networks:
       - agentic_net
+    command: ["node", "dist/index.js", "gateway", "--bind", "lan", "--port", "${OPENCLAW_PORT}"]
+
+  # Used only for one-off commands: docker compose run --rm openclaw-cli <args>
+  openclaw-cli:
+    image: ghcr.io/openclaw/openclaw:${OPENCLAW_TAG}
+    network_mode: "service:openclaw-gateway"
+    profiles: ["cli"]
+    init: true
+    stdin_open: true
+    tty: true
+    env_file:
+      - stack.env
+    environment:
+      HOME: /home/node
+      OPENCLAW_HOME: /home/node
+      OPENCLAW_STATE_DIR: /home/node/.openclaw
+      OPENCLAW_CONFIG_DIR: /home/node/.openclaw
+      OPENCLAW_CONFIG_PATH: /home/node/.openclaw/openclaw.json
+      OPENCLAW_WORKSPACE_DIR: /home/node/.openclaw/workspace
+      BROWSER: echo
+      TERM: xterm-256color
+      TZ: ${TIMEZONE}
+    volumes:
+      - ./openclaw:/home/node/.openclaw
+      - ./openclaw-workspace:/home/node/.openclaw/workspace
+      - ./openclaw-secrets:/home/node/.config/openclaw
+    cap_drop:
+      - NET_RAW
+      - NET_ADMIN
+    security_opt:
+      - no-new-privileges:true
+    entrypoint: ["node", "dist/index.js"]
     depends_on:
-      - n8n
+      - openclaw-gateway
 
 volumes:
   n8n_data:
-  openclaw_data:
 
 networks:
   agentic_net:
     driver: bridge
-ENDOFCOMPOSE
-
-print_ok "docker-compose.yml written to ${DEPLOY_DIR}/docker-compose.yml"
-
-cd "$DEPLOY_DIR"
-
-print_step "Pulling Docker images ..."
-docker compose pull >/tmp/setup_last_output.log 2>&1 || print_warn "Some images may not have pulled cleanly. Continuing ..."
-
-run_quietly "Starting all containers" docker compose up -d
-
-sleep 4
-print_ok "Containers started:"
-docker compose ps
+    ipam:
+      config:
+        - subnet: ${DOCKER_SUBNET}
+          gateway: ${DOCKER_GW}
+EOF
+chmod 600 "${DEPLOY_DIR}/docker-compose.yml"
+print_ok "Compose file written"
 
 # =============================================================================
-#   PHASE 4b: OpenClaw Post-Boot Stabilization
+#   PHASE 6 - Nginx (HTTP first, so Certbot can validate)
 # =============================================================================
-echo ""
-separator
-echo ""
-echo -e "  ${BOLD}OpenClaw Gateway Stabilization${RESET}"
-print_info "Waiting for OpenClaw gateway to fully initialize ..."
+print_phase "PHASE 6 / 9  --  Nginx reverse proxy"
 
-# Wait for the OpenClaw container to report healthy/running
-OPENCLAW_READY=false
-for i in $(seq 1 15); do
-    if docker exec openclaw openclaw status --quiet >/dev/null 2>&1; then
-        OPENCLAW_READY=true
-        break
-    fi
-    sleep 2
-done
+run_step "Installing Nginx" apt-get install "${APT_OPTS[@]}" nginx
 
-if [ "$OPENCLAW_READY" = true ]; then
-    print_ok "OpenClaw gateway is running"
+# The ACME challenge directory must be traversable by the Nginx worker.
+mkdir -p "$WEBROOT/.well-known/acme-challenge"
+chmod -R 755 "$WEBROOT"
+chown -R www-data:www-data "$WEBROOT"
+
+# --- Portability: the "http2 on;" directive only exists from Nginx 1.25.1.
+# Ubuntu 22.04 ships 1.18 and 24.04 ships 1.24, so pick the right syntax.
+NGINX_VER="$(nginx -v 2>&1 | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' || echo 0.0.0)"
+ver_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1)" = "$2" ]; }
+if ver_ge "$NGINX_VER" "1.25.1"; then
+    SSL_LISTEN_4="listen 443 ssl;"
+    SSL_LISTEN_6="listen [::]:443 ssl;"
+    HTTP2_LINE="    http2 on;"
 else
-    print_warn "OpenClaw may still be starting. Continuing with stabilization ..."
+    SSL_LISTEN_4="listen 443 ssl http2;"
+    SSL_LISTEN_6="listen [::]:443 ssl http2;"
+    HTTP2_LINE=""
+fi
+print_info "Nginx ${NGINX_VER} detected"
+
+# --- Portability: "listen [::]" fails outright when IPv6 is off in the kernel.
+if [ "$HOST_HAS_IPV6" = true ] || [ -f /proc/net/if_inet6 ]; then
+    L6_80="    listen [::]:80;"
+    L6_80_DEF="    listen [::]:80 default_server;"
+    L6_443="    ${SSL_LISTEN_6}"
+else
+    L6_80=""; L6_80_DEF=""; L6_443=""
+    print_info "IPv6 is disabled on this server - Nginx will listen on IPv4 only"
 fi
 
-# Step 4b.1: Run doctor to clear any restart-loop breaker state
-print_step "Running 'openclaw doctor --fix' to clear restart-loop breaker ..."
-if docker exec openclaw openclaw doctor --fix >/tmp/setup_last_output.log 2>&1; then
-    print_ok "Doctor fix completed — gateway state is clean"
-else
-    print_warn "Doctor returned warnings (usually harmless). Continuing ..."
-fi
+# WebSocket upgrade map (http context, needed by both sites).
+cat >/etc/nginx/conf.d/agentic-upgrade.conf <<'EOF'
+# Only send "Connection: upgrade" for real WebSocket requests.
+map $http_upgrade $agentic_connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+EOF
 
-# Step 4b.2: Pre-install WhatsApp and Telegram plugins
-print_step "Pre-installing WhatsApp and Telegram channel plugins ..."
-if docker exec openclaw openclaw plugins install clawhub:@openclaw/whatsapp clawhub:@openclaw/telegram >/tmp/setup_last_output.log 2>&1; then
-    print_ok "WhatsApp and Telegram plugins installed"
-else
-    print_warn "Plugin install returned warnings. Plugins may already be installed."
-fi
+# Catch-all: anything hitting the bare IP or an unknown hostname is dropped.
+# Without this, the n8n login page is served on http://<VPS_IP> to every
+# internet scanner, which is both a leak and a reputation problem.
+cat >/etc/nginx/sites-available/000-agentic-default <<EOF
+server {
+    listen 80 default_server;
+${L6_80_DEF}
+    server_name _;
+    location /.well-known/acme-challenge/ { root ${WEBROOT}; }
+    location / { return 444; }
+}
+EOF
 
-# Step 4b.3: Restart OpenClaw cleanly to load plugins
-print_step "Restarting OpenClaw for a clean boot with plugins loaded ..."
-docker compose restart openclaw >/tmp/setup_last_output.log 2>&1
-sleep 8
-print_ok "OpenClaw restarted with plugins active"
-
-# Step 4b.4: Verify channel health
-print_step "Verifying channel health ..."
-if docker exec openclaw openclaw channels status --probe >/tmp/setup_last_output.log 2>&1; then
-    print_ok "Channel providers are active and ready for pairing"
-else
-    print_warn "Channel probe returned warnings. WhatsApp/Telegram can still be paired later."
-fi
-
-# =============================================================================
-#   PHASE 5: Nginx Reverse Proxy
-# =============================================================================
-print_phase "PHASE 5 -- Nginx Reverse Proxy Configuration"
-
-run_quietly "Installing Nginx" apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" nginx
-
-print_step "Writing Nginx config for ${N8N_SUBDOMAIN} ..."
-
-cat > "/etc/nginx/sites-available/n8n" << ENDOFNGINX
-# Agentic AI Bootcamp - n8n Reverse Proxy
-# Domain: ${N8N_SUBDOMAIN}
-
+write_site_http() {
+    local name="$1" host="$2"
+    cat >"/etc/nginx/sites-available/${name}" <<EOF
 server {
     listen 80;
-    server_name ${N8N_SUBDOMAIN};
+${L6_80}
+    server_name ${host};
 
-    # WhatsApp/Meta GET verification handshake bypass
-    location ~ ^/webhook(-test)?/(personal-assistant|cashflow-agent|whatsapp) {
-        if (\$request_method = GET) {
-            add_header Content-Type text/plain;
-            return 200 \$arg_hub_challenge;
-        }
-        proxy_pass http://127.0.0.1:5678;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host \$host;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        chunked_transfer_encoding off;
-        proxy_buffering off;
-        proxy_cache off;
+    location /.well-known/acme-challenge/ { root ${WEBROOT}; }
+    location / { return 200 'Setup in progress. SSL certificate pending.\n'; add_header Content-Type text/plain; }
+}
+EOF
+}
+
+write_site_https() {
+    local name="$1" host="$2" port="$3" body_limit="$4"
+    local ssl_extra=""
+    [ -f /etc/letsencrypt/options-ssl-nginx.conf ] && ssl_extra="    include /etc/letsencrypt/options-ssl-nginx.conf;"
+    [ -f /etc/letsencrypt/ssl-dhparams.pem ] && ssl_extra="${ssl_extra}
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;"
+
+    cat >"/etc/nginx/sites-available/${name}" <<EOF
+server {
+    listen 80;
+${L6_80}
+    server_name ${host};
+
+    location /.well-known/acme-challenge/ { root ${WEBROOT}; }
+    location / { return 301 https://\$host\$request_uri; }
+}
+
+server {
+    ${SSL_LISTEN_4}
+${L6_443}
+${HTTP2_LINE}
+    server_name ${host};
+
+    ssl_certificate     /etc/letsencrypt/live/${N8N_HOSTNAME}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${N8N_HOSTNAME}/privkey.pem;
+${ssl_extra}
+
+    # Keep this instance out of search engines and crawler databases.
+    add_header X-Robots-Tag "noindex, nofollow, noarchive" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+    client_max_body_size ${body_limit};
+
+    location = /robots.txt {
+        add_header Content-Type text/plain;
+        return 200 "User-agent: *\nDisallow: /\n";
     }
 
-    # Main n8n web interface and WebSocket support
     location / {
-        proxy_pass http://127.0.0.1:5678;
+        proxy_pass http://127.0.0.1:${port};
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-        chunked_transfer_encoding off;
+
+        proxy_set_header Upgrade           \$http_upgrade;
+        proxy_set_header Connection        \$agentic_connection_upgrade;
+        proxy_set_header Host              \$host;
+        proxy_set_header X-Real-IP         \$remote_addr;
+        proxy_set_header X-Forwarded-For   \$remote_addr;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Forwarded-Host  \$host;
+        proxy_set_header Origin            \$http_origin;
+
         proxy_buffering off;
         proxy_cache off;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_set_header Host \$host;
+        proxy_request_buffering off;
+        chunked_transfer_encoding off;
+
+        # Long-running workflows, streaming responses and websockets.
+        proxy_connect_timeout 60s;
+        proxy_send_timeout    3600s;
+        proxy_read_timeout    3600s;
     }
 }
-ENDOFNGINX
+EOF
+}
 
-print_ok "Nginx config written to /etc/nginx/sites-available/n8n"
+print_step "Writing Nginx sites ..."
+write_site_http n8n  "$N8N_HOSTNAME"
+write_site_http claw "$CLAW_HOSTNAME"
 
-# Enable site
-rm -f "/etc/nginx/sites-enabled/n8n"
-ln -s /etc/nginx/sites-available/n8n /etc/nginx/sites-enabled/n8n
+rm -f /etc/nginx/sites-enabled/default
+ln -sf /etc/nginx/sites-available/000-agentic-default /etc/nginx/sites-enabled/000-agentic-default
+ln -sf /etc/nginx/sites-available/n8n  /etc/nginx/sites-enabled/n8n
+ln -sf /etc/nginx/sites-available/claw /etc/nginx/sites-enabled/claw
 
-# Disable default site to avoid conflicts
-rm -f "/etc/nginx/sites-enabled/default"
-print_info "Default Nginx site disabled (port conflict prevention)"
+run_step "Validating Nginx configuration" nginx -t
+run_step "Starting Nginx"                 systemctl restart nginx
+run_step "Enabling Nginx at boot"         systemctl enable nginx
+print_ok "Nginx is serving HTTP for both hostnames"
 
-print_step "Testing Nginx configuration ..."
-if nginx -t >/tmp/setup_last_output.log 2>&1; then
-    print_ok "Nginx configuration is valid"
+# =============================================================================
+#   PHASE 7 - SSL certificate (webroot mode: never rewrites our config)
+# =============================================================================
+print_phase "PHASE 7 / 9  --  Free SSL certificate"
+
+run_step "Installing Certbot" apt-get install "${APT_OPTS[@]}" certbot python3-certbot-nginx
+
+SSL_OK=false
+issue_certificate() {
+    print_step "Requesting a certificate for ${N8N_HOSTNAME} and ${CLAW_HOSTNAME} ..."
+    if certbot certonly --webroot -w "$WEBROOT" \
+            --non-interactive --agree-tos --no-eff-email \
+            --email "$CERTBOT_EMAIL" \
+            --cert-name "$N8N_HOSTNAME" \
+            --keep-until-expiring --expand \
+            -d "$N8N_HOSTNAME" -d "$CLAW_HOSTNAME" \
+            >/tmp/agentic_certbot.log 2>&1; then
+        return 0
+    fi
+    return 1
+}
+
+if issue_certificate; then
+    SSL_OK=true
+    print_ok "Certificate issued for both hostnames"
 else
-    print_error "Nginx config test failed!"
-    cat /tmp/setup_last_output.log
-    exit 1
+    print_warn "Could not get a certificate covering both hostnames."
+    print_info "Trying ${N8N_HOSTNAME} on its own ..."
+    if certbot certonly --webroot -w "$WEBROOT" \
+            --non-interactive --agree-tos --no-eff-email \
+            --email "$CERTBOT_EMAIL" --cert-name "$N8N_HOSTNAME" \
+            --keep-until-expiring -d "$N8N_HOSTNAME" \
+            >>/tmp/agentic_certbot.log 2>&1; then
+        SSL_OK=partial
+        print_ok "Certificate issued for ${N8N_HOSTNAME} only"
+        print_warn "${CLAW_HOSTNAME} has no certificate yet - check its DNS record, then run: agentic ssl"
+    else
+        print_error "Certbot could not issue any certificate."
+        echo ""
+        tail -n 25 /tmp/agentic_certbot.log
+        echo ""
+        print_info "Most common causes:"
+        print_info "  1. The A record does not point to ${VPS_IP} yet."
+        print_info "  2. An AAAA (IPv6) record exists but this server has no IPv6."
+        print_info "  3. Port 80 is blocked by the provider firewall (check the Hostinger panel)."
+        print_info "After fixing, run:  agentic ssl"
+    fi
 fi
 
-run_quietly "Restarting Nginx" systemctl restart nginx
-run_quietly "Enabling Nginx on boot" systemctl enable nginx
-print_ok "Nginx is running as reverse proxy for ${N8N_SUBDOMAIN}"
+if [ "$SSL_OK" != "false" ]; then
+    print_step "Switching Nginx to HTTPS ..."
+    write_site_https n8n "$N8N_HOSTNAME" "$N8N_PORT" "100m"
+    if [ "$SSL_OK" = true ]; then
+        write_site_https claw "$CLAW_HOSTNAME" "$OPENCLAW_PORT" "50m"
+    fi
+    run_step "Validating HTTPS configuration" nginx -t
+    run_step "Reloading Nginx"                systemctl reload nginx
+    print_ok "HTTPS is live, HTTP redirects automatically"
+fi
 
-# =============================================================================
-#   PHASE 6: SSL Certificate via Let's Encrypt
-# =============================================================================
-print_phase "PHASE 6 -- SSL/TLS Certificate (Let's Encrypt / Certbot)"
+# Renewal: reload nginx after each successful renewal.
+mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+cat >/etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh <<'EOF'
+#!/bin/sh
+systemctl reload nginx
+EOF
+chmod +x /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
 
-run_quietly "Installing Certbot and Nginx plugin" apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" certbot python3-certbot-nginx
-
-print_step "Requesting SSL certificate for ${N8N_SUBDOMAIN} ..."
-print_info "DNS must be fully propagated for this to succeed."
-echo ""
-
-if certbot --nginx \
-           --non-interactive \
-           --agree-tos \
-           --email "$CERTBOT_EMAIL" \
-           -d "$N8N_SUBDOMAIN" \
-           --redirect \
-           >/tmp/certbot_output.log 2>&1; then
-    print_ok "SSL certificate issued and installed!"
-    print_ok "HTTP is auto-redirected to HTTPS"
+if systemctl list-timers 2>/dev/null | grep -q certbot; then
+    print_ok "Automatic renewal is handled by the certbot systemd timer"
 else
-    echo ""
-    print_error "Certbot failed to issue the certificate."
-    print_warn "This usually means DNS has not fully propagated yet."
-    echo ""
-    print_info "Full Certbot log:"
-    cat /tmp/certbot_output.log
-    echo ""
-    print_info "To retry SSL after DNS propagates, run:"
-    echo "    certbot --nginx --email $CERTBOT_EMAIL -d $N8N_SUBDOMAIN"
-    echo ""
-    print_warn "Your n8n stack is still running over HTTP. SSL can be added later."
-fi
-
-# Certbot auto-renewal check
-if systemctl is-active --quiet certbot.timer 2>/dev/null; then
-    print_ok "Certbot auto-renewal timer is active"
-elif ! crontab -l 2>/dev/null | grep -q certbot; then
-    (crontab -l 2>/dev/null || true; echo "0 3 * * * certbot renew --quiet && systemctl reload nginx") | crontab -
-    print_ok "Certbot renewal cron job added (runs daily at 3:00 AM)"
+    (crontab -l 2>/dev/null | grep -v 'certbot renew' || true; \
+     echo "17 3 * * * certbot renew --quiet") | crontab -
+    print_ok "Automatic renewal cron job installed (daily 03:17)"
 fi
 
 # =============================================================================
-#   Final Health Check
+#   PHASE 8 - Start the stack
 # =============================================================================
-print_phase "Final Health Check"
+print_phase "PHASE 8 / 9  --  Starting n8n and OpenClaw"
 
-print_step "Docker containers:"
 cd "$DEPLOY_DIR"
-docker compose ps
-echo ""
 
-if systemctl is-active --quiet nginx; then
-    print_ok "Nginx: running"
+print_step "Downloading container images (this is the slowest step, 2-5 minutes) ..."
+if ! docker compose pull n8n openclaw-gateway >/tmp/agentic_last.log 2>&1; then
+    print_warn "ghcr.io pull failed. Falling back to the Docker Hub mirror for OpenClaw."
+    sed -i "s|ghcr.io/openclaw/openclaw:|openclaw/openclaw:|g" docker-compose.yml
+    run_step "Downloading images (mirror)" docker compose pull n8n openclaw-gateway
 else
-    print_warn "Nginx may not be running. Check: systemctl status nginx"
+    print_ok "Images downloaded"
 fi
 
-if ss -tlnp 2>/dev/null | grep -q ':5678'; then
-    print_ok "n8n: listening on port 5678"
+run_step "Starting containers" docker compose up -d n8n openclaw-gateway
+
+# --- Wait for n8n ---
+print_step "Waiting for n8n to become ready ..."
+n8n_up=false
+for _ in $(seq 1 60); do
+    if curl -fsS --max-time 3 "http://127.0.0.1:${N8N_PORT}/healthz" >/dev/null 2>&1; then
+        n8n_up=true; break
+    fi
+    sleep 3
+done
+if [ "$n8n_up" = true ]; then
+    print_ok "n8n is responding on port ${N8N_PORT}"
 else
-    print_warn "n8n may still be starting. Wait 30 seconds then run: docker compose ps"
+    print_warn "n8n did not answer within 3 minutes. Check:  agentic logs n8n"
 fi
 
-if ss -tlnp 2>/dev/null | grep -q ':8080'; then
-    print_ok "OpenClaw: listening on port 8080"
+# --- Wait for OpenClaw ---
+print_step "Waiting for the OpenClaw gateway to become ready ..."
+oc_up=false
+for _ in $(seq 1 60); do
+    if curl -fsS --max-time 3 "http://127.0.0.1:${OPENCLAW_PORT}/healthz" >/dev/null 2>&1; then
+        oc_up=true; break
+    fi
+    sleep 3
+done
+if [ "$oc_up" = true ]; then
+    print_ok "OpenClaw gateway is responding on port ${OPENCLAW_PORT}"
 else
-    print_warn "OpenClaw may still be starting. Check: docker compose logs openclaw"
+    print_warn "OpenClaw did not answer within 3 minutes. Check:  agentic logs claw"
 fi
 
 # =============================================================================
-#   Setup Complete!
+#   PHASE 9 - OpenClaw bootstrap + helper command
 # =============================================================================
-print_phase "Setup Complete!"
+print_phase "PHASE 9 / 9  --  OpenClaw setup and the 'agentic' helper"
 
-echo -e "${GREEN}"
-echo "  +====================================================================+"
-echo "  |                    Setup Successful!                              |"
-echo "  +====================================================================+"
-echo -e "${RESET}"
+oc_cli() { docker compose -f "${DEPLOY_DIR}/docker-compose.yml" run --rm -T openclaw-cli "$@"; }
 
-echo -e "  ${BOLD}Your Agentic AI Stack is now live:${RESET}"
-echo ""
-echo -e "  n8n Dashboard:      ${CYAN}https://${N8N_SUBDOMAIN}${RESET}"
-echo -e "  Username:           ${CYAN}${N8N_USER}${RESET}"
-echo -e "  Password:           [the one you entered]"
-echo -e "  AI Provider:        ${CYAN}${AI_LABEL} (${AI_MODEL})${RESET}"
-echo -e "  OpenClaw Dashboard: ${CYAN}http://localhost:8080 (via SSH tunnel)${RESET}"
+# --- Pick a model from the list OpenClaw actually reports --------------------
+AI_MODEL=""
+if [ "$oc_up" = true ]; then
+    print_step "Asking OpenClaw which ${AI_LABEL} models your key can use ..."
+    MODEL_RAW="$(oc_cli models list --provider "$AI_PROVIDER" 2>/dev/null || true)"
+    MODEL_LIST=()
+    mapfile -t MODEL_LIST < <(printf '%s\n' "$MODEL_RAW" \
+        | grep -Eo "${AI_PROVIDER}/[A-Za-z0-9._-]+" | sort -u | head -n 12 || true)
+
+    if [ "${#MODEL_LIST[@]}" -gt 0 ]; then
+        echo ""
+        echo "  ${BOLD}Models available to your account:${RESET}"
+        choose MODEL_CHOICE "Choose the model OpenClaw should use" "${MODEL_LIST[@]}"
+        AI_MODEL="${MODEL_LIST[$((MODEL_CHOICE - 1))]}"
+    else
+        AI_MODEL="$AI_MODEL_DEFAULT"
+        [ -n "$AI_MODEL" ] && print_info "Could not list models; using the default ${AI_MODEL}"
+    fi
+
+    if [ -n "$AI_MODEL" ]; then
+        run_soft "Setting default model to ${AI_MODEL}" \
+            oc_cli config set agents.defaults.model.primary "$AI_MODEL" || true
+    else
+        print_info "No model was set. Pick one later with:  agentic model"
+    fi
+
+    # --- Channel plugins (WhatsApp is external, Telegram ships built in) -----
+    run_soft "Installing the WhatsApp channel plugin" \
+        oc_cli plugins install clawhub:@openclaw/whatsapp || \
+        print_info "WhatsApp plugin can be installed later with:  agentic whatsapp"
+
+    run_soft "Running OpenClaw self-check" oc_cli doctor --fix || true
+
+    run_step "Restarting OpenClaw so plugins and settings load" \
+        docker compose -f "${DEPLOY_DIR}/docker-compose.yml" restart openclaw-gateway
+
+    for _ in $(seq 1 40); do
+        curl -fsS --max-time 3 "http://127.0.0.1:${OPENCLAW_PORT}/healthz" >/dev/null 2>&1 && break
+        sleep 3
+    done
+    print_ok "OpenClaw restarted"
+else
+    print_warn "Skipping OpenClaw configuration because the gateway is not responding yet."
+    print_info "Once it is up, run:  agentic doctor"
+fi
+
+# --- Install the 'agentic' helper command -----------------------------------
+print_step "Installing the 'agentic' helper command ..."
+cat >/usr/local/bin/agentic <<'AGENTIC_EOF'
+#!/usr/bin/env bash
+# Agentic AI Bootcamp - one command for everything.
+set -uo pipefail
+
+DEPLOY_DIR="/opt/agentic-stack"
+CONF_FILE="/etc/agentic-stack.conf"
+CREDS_FILE="/root/AGENTIC-CREDENTIALS.txt"
+WEBROOT="/var/www/acme"
+OPENCLAW_PORT=18789
+N8N_PORT=5678
+
+[ -f "$CONF_FILE" ] && . "$CONF_FILE"
+
+C=$'\033[0;36m'; G=$'\033[0;32m'; Y=$'\033[1;33m'; R=$'\033[0;31m'; B=$'\033[1m'; D=$'\033[2m'; N=$'\033[0m'
+ok()   { echo "  ${G}[ OK ]${N} $1"; }
+warn() { echo "  ${Y}[WARN]${N} $1"; }
+bad()  { echo "  ${R}[FAIL]${N} $1"; }
+info() { echo "  ${D}$1${N}"; }
+head_() { echo ""; echo "${B}== $1 ==${N}"; echo ""; }
+
+if [ "${EUID:-$(id -u)}" -ne 0 ]; then echo "Run with sudo:  sudo agentic $*"; exit 1; fi
+
+dc()     { docker compose -f "${DEPLOY_DIR}/docker-compose.yml" "$@"; }
+oc()     { dc run --rm openclaw-cli "$@"; }
+oc_q()   { dc run --rm -T openclaw-cli "$@"; }
+token()  { grep -m1 '^OPENCLAW_GATEWAY_TOKEN=' "${DEPLOY_DIR}/stack.env" 2>/dev/null | cut -d= -f2-; }
+
+usage() {
+cat <<EOF
+
+  ${B}agentic${N} - manage your Agentic AI stack
+
+  ${B}Everyday${N}
+    agentic status            Show what is running and whether it is healthy
+    agentic urls              Print your n8n and OpenClaw links
+    agentic open              Print the one-click OpenClaw dashboard login link
+    agentic token             Show your OpenClaw dashboard password
+    agentic logs [n8n|claw]   Follow live logs (Ctrl+C to stop)
+    agentic restart [n8n|claw]
+    agentic safebrowsing      Fix Chrome's red "Deceptive site ahead" page
+
+  ${B}OpenClaw${N}
+    agentic whatsapp          Pair WhatsApp (shows the QR code)
+    agentic approve           Approve a device waiting to log in
+    agentic model [ref]       List or change the AI model
+    agentic doctor            Run OpenClaw self-repair
+    agentic claw <args...>    Run any raw OpenClaw CLI command
+
+  ${B}Maintenance${N}
+    agentic ssl               Issue or renew the SSL certificate
+    agentic dns               Check that DNS points here
+    agentic update            Pull the newest images and restart
+    agentic backup            Save n8n data + OpenClaw config to /root/backups
+    agentic creds             Show the saved credentials file
+
+EOF
+}
+
+cmd_urls() {
+    head_ "Your links"
+    echo "  n8n              ${C}https://${N8N_HOSTNAME:-n8n.example.com}${N}"
+    echo "  OpenClaw         ${C}https://${CLAW_HOSTNAME:-claw.example.com}${N}"
+    echo ""
+}
+
+cmd_token() {
+    local t; t="$(token)"
+    head_ "Your OpenClaw dashboard password"
+    if [ -z "$t" ]; then bad "No password found in ${DEPLOY_DIR}/stack.env"; return 1; fi
+    echo "  ${B}${t}${N}"
+    echo ""
+    info "This is the password you chose during setup."
+    info "OpenClaw's dashboard calls it the 'gateway token'."
+    info "Dashboard: https://${CLAW_HOSTNAME:-claw.example.com}"
+    echo ""
+}
+
+cmd_safebrowsing() {
+    head_ "Red \"Deceptive site ahead\" page in Chrome"
+    echo "  This is ${B}not${N} an SSL problem - your certificate is valid."
+    echo "  Google Safe Browsing sometimes false-flags self-hosted n8n."
+    echo ""
+    echo "  ${B}To keep working right now${N}"
+    echo "    Click ${B}Details${N} on the red page, then ${B}visit this unsafe site${N}."
+    echo ""
+    echo "  ${B}To clear it permanently${N}"
+    echo "    1. Open ${C}https://search.google.com/search-console${N}"
+    echo "    2. Add a ${B}Domain${N} property for ${B}${DOMAIN:-your-domain.com}${N}"
+    echo "       Verify with the TXT record it gives you."
+    echo "       A Domain property covers ${N8N_HOSTNAME:-n8n.*} and ${CLAW_HOSTNAME:-claw.*} at once."
+    echo "    3. Go to ${B}Security & Manual Actions${N} -> ${B}Security Issues${N}"
+    echo "    4. Click ${B}Request Review${N}. Describe it as a private automation"
+    echo "       tool for your own use, not a public website."
+    echo ""
+    echo "  ${B}Check your current status${N}"
+    echo "    ${C}https://transparencyreport.google.com/safe-browsing/search?url=${N8N_HOSTNAME:-}${N}"
+    echo ""
+    echo "  ${B}Already done by this server to reduce the risk${N}"
+    for f in \
+        "noindex/nofollow headers and a blocking robots.txt on both sites" \
+        "requests to the bare IP address are refused, not served the login page" \
+        "HTTPS enforced, HTTP redirects"; do
+        ok "$f"
+    done
+    echo ""
+    info "Reviews usually clear within 1-3 days."
+    echo ""
+}
+
+cmd_open() {
+    head_ "One-click dashboard login"
+    local out url
+    out="$(oc_q dashboard --no-open 2>&1 || true)"
+    url="$(printf '%s' "$out" | grep -Eo 'https?://[^[:space:]]+' | head -n1)"
+    if [ -n "$url" ] && [ -n "${CLAW_HOSTNAME:-}" ]; then
+        url="$(printf '%s' "$url" | sed -E "s#https?://(127\.0\.0\.1|localhost|0\.0\.0\.0)(:[0-9]+)?#https://${CLAW_HOSTNAME}#")"
+        echo "  Open this link in your browser (valid once, expires quickly):"
+        echo ""
+        echo "  ${C}${url}${N}"
+        echo ""
+    else
+        warn "Could not generate a one-time link."
+        info "Use the token instead:  sudo agentic token"
+        [ -n "$out" ] && { echo ""; echo "$out"; }
+    fi
+}
+
+cmd_status() {
+    head_ "Containers"
+    dc ps
+    head_ "Services"
+    systemctl is-active --quiet nginx && ok "Nginx running" || bad "Nginx not running"
+    systemctl is-active --quiet docker && ok "Docker running" || bad "Docker not running"
+
+    if curl -fsS --max-time 4 "http://127.0.0.1:${N8N_PORT}/healthz" >/dev/null 2>&1; then
+        ok "n8n responding on ${N8N_PORT}"
+    else bad "n8n not responding on ${N8N_PORT}"; fi
+
+    if curl -fsS --max-time 4 "http://127.0.0.1:${OPENCLAW_PORT}/healthz" >/dev/null 2>&1; then
+        ok "OpenClaw responding on ${OPENCLAW_PORT}"
+    else bad "OpenClaw not responding on ${OPENCLAW_PORT}"; fi
+
+    head_ "Public reachability"
+    for h in "${N8N_HOSTNAME:-}" "${CLAW_HOSTNAME:-}"; do
+        [ -z "$h" ] && continue
+        code="$(curl -o /dev/null -sS -w '%{http_code}' --max-time 8 "https://${h}" 2>/dev/null || echo 000)"
+        if [ "$code" = "000" ]; then bad "https://${h} unreachable"
+        else ok "https://${h} -> HTTP ${code}"; fi
+    done
+
+    head_ "SSL certificate"
+    if [ -n "${N8N_HOSTNAME:-}" ] && [ -f "/etc/letsencrypt/live/${N8N_HOSTNAME}/fullchain.pem" ]; then
+        local exp names
+        exp="$(openssl x509 -enddate -noout -in "/etc/letsencrypt/live/${N8N_HOSTNAME}/fullchain.pem" | cut -d= -f2)"
+        names="$(openssl x509 -noout -text -in "/etc/letsencrypt/live/${N8N_HOSTNAME}/fullchain.pem" \
+                 | grep -A1 'Subject Alternative Name' | tail -n1 | tr -d ' ' )"
+        ok "Expires: ${exp}"
+        info "Covers: ${names//DNS:/}"
+        for h in "${N8N_HOSTNAME:-}" "${CLAW_HOSTNAME:-}"; do
+            case "$names" in *"DNS:${h}"*) ok "${h} is covered" ;; *) warn "${h} is NOT covered - run: sudo agentic ssl" ;; esac
+        done
+    else
+        bad "No certificate found. Run: sudo agentic ssl"
+    fi
+
+    head_ "Resources"
+    free -h | head -n3
+    echo ""
+    df -h / | tail -n1
+    echo ""
+}
+
+cmd_dns() {
+    head_ "DNS check"
+    local myip; myip="$(curl -4 -fsS --max-time 8 https://api.ipify.org 2>/dev/null || echo "${VPS_IP:-unknown}")"
+    info "This server: ${myip}"
+    echo ""
+    for h in "${N8N_HOSTNAME:-}" "${CLAW_HOSTNAME:-}"; do
+        [ -z "$h" ] && continue
+        local a aaaa
+        a="$(dig +short A "$h" @1.1.1.1 2>/dev/null | grep -Eo '^[0-9]+(\.[0-9]+){3}$' | tail -n1)"
+        aaaa="$(dig +short AAAA "$h" @1.1.1.1 2>/dev/null | grep ':' | tail -n1)"
+        if [ "$a" = "$myip" ]; then ok "${h} -> ${a}"
+        else bad "${h} -> ${a:-nothing} (should be ${myip})"; fi
+        [ -n "$aaaa" ] && warn "${h} has an IPv6 (AAAA) record: ${aaaa} - delete it if SSL fails"
+    done
+    echo ""
+}
+
+cmd_ssl() {
+    head_ "Issuing / renewing SSL"
+    [ -z "${N8N_HOSTNAME:-}" ] && { bad "No configuration found at ${CONF_FILE}"; return 1; }
+    mkdir -p "$WEBROOT/.well-known/acme-challenge"
+    certbot certonly --webroot -w "$WEBROOT" --non-interactive --agree-tos --no-eff-email \
+        --email "${CERTBOT_EMAIL}" --cert-name "${N8N_HOSTNAME}" --keep-until-expiring --expand \
+        -d "${N8N_HOSTNAME}" -d "${CLAW_HOSTNAME}"
+    local rc=$?
+    if [ $rc -eq 0 ]; then
+        nginx -t && systemctl reload nginx && ok "Certificate in place, Nginx reloaded"
+    else
+        bad "Certbot failed. Run 'sudo agentic dns' first - DNS is the usual cause."
+    fi
+}
+
+cmd_backup() {
+    head_ "Backup"
+    local dest="/root/backups"; mkdir -p "$dest"
+    local stamp; stamp="$(date +%Y%m%d-%H%M%S)"
+    docker run --rm -v agentic-stack_n8n_data:/data -v "${dest}:/backup" alpine \
+        tar czf "/backup/n8n-${stamp}.tar.gz" -C /data . 2>/dev/null \
+        && ok "n8n data -> ${dest}/n8n-${stamp}.tar.gz" || warn "n8n volume backup failed"
+    tar czf "${dest}/openclaw-${stamp}.tar.gz" -C "$DEPLOY_DIR" openclaw openclaw-secrets stack.env 2>/dev/null \
+        && ok "OpenClaw config -> ${dest}/openclaw-${stamp}.tar.gz" || warn "OpenClaw backup failed"
+    echo ""
+}
+
+cmd_model() {
+    if [ -n "${1:-}" ]; then
+        oc_q config set agents.defaults.model.primary "$1" && ok "Model set to $1"
+        dc restart openclaw-gateway >/dev/null 2>&1 && ok "Gateway restarted"
+    else
+        head_ "Available models"
+        oc models list
+        echo ""
+        info "Change it with:  sudo agentic model <provider/model>"
+    fi
+}
+
+case "${1:-help}" in
+    status)   cmd_status ;;
+    urls)     cmd_urls ;;
+    token|password) cmd_token ;;
+    open|link|pair) cmd_open ;;
+    safebrowsing|deceptive|redpage) cmd_safebrowsing ;;
+    dns)      cmd_dns ;;
+    ssl)      cmd_ssl ;;
+    backup)   cmd_backup ;;
+    creds)    [ -f "$CREDS_FILE" ] && cat "$CREDS_FILE" || bad "No credentials file at ${CREDS_FILE}" ;;
+    model)    shift; cmd_model "${1:-}" ;;
+    doctor)   head_ "OpenClaw self-repair"; oc doctor --fix; dc restart openclaw-gateway ;;
+    whatsapp) head_ "WhatsApp pairing"
+              info "A QR code will appear. Scan it with: WhatsApp > Settings > Linked devices > Link a device"
+              echo ""
+              oc channels login --channel whatsapp ;;
+    approve)  head_ "Devices waiting for approval"
+              oc devices list
+              echo ""
+              read -rp "  Request ID to approve (Enter to skip): " rid
+              [ -n "${rid:-}" ] && oc devices approve "$rid" ;;
+    claw)     shift; oc "$@" ;;
+    logs)     case "${2:-all}" in
+                  n8n)  dc logs -f --tail=100 n8n ;;
+                  claw|openclaw) dc logs -f --tail=100 openclaw-gateway ;;
+                  *)    dc logs -f --tail=50 ;;
+              esac ;;
+    restart)  case "${2:-all}" in
+                  n8n)  dc restart n8n ;;
+                  claw|openclaw) dc restart openclaw-gateway ;;
+                  *)    dc restart; systemctl reload nginx ;;
+              esac; ok "Restarted" ;;
+    update)   head_ "Updating"
+              dc pull n8n openclaw-gateway && dc up -d n8n openclaw-gateway && ok "Updated"
+              docker image prune -f >/dev/null 2>&1 || true ;;
+    stop)     dc down && ok "Stack stopped" ;;
+    start)    dc up -d n8n openclaw-gateway && ok "Stack started" ;;
+    help|-h|--help) usage ;;
+    *)        bad "Unknown command: $1"; usage; exit 1 ;;
+esac
+AGENTIC_EOF
+chmod 755 /usr/local/bin/agentic
+print_ok "Type 'sudo agentic' any time to manage the stack"
+
+# =============================================================================
+#   Credentials file
+# =============================================================================
+umask 077
+cat >"$CREDS_FILE" <<EOF
+================================================================
+  AGENTIC AI BOOTCAMP - YOUR SERVER DETAILS
+  Generated: $(date)
+  KEEP THIS FILE PRIVATE.
+================================================================
+
+n8n
+  URL          https://${N8N_HOSTNAME}
+  Account      You create it yourself on first visit (email + password).
+               n8n manages its own accounts - there is no separate
+               server password.
+
+OpenClaw dashboard
+  URL          https://${CLAW_HOSTNAME}
+  Password     the one YOU chose during setup (OpenClaw calls it a
+               "gateway token"). Forgotten it?  sudo agentic token
+  Easiest login:  sudo agentic open      (one-click, no typing)
+
+AI provider     ${AI_LABEL}
+AI model        ${AI_MODEL:-not set yet - run: sudo agentic model}
+
+Files
+  Stack         ${DEPLOY_DIR}/docker-compose.yml
+  Secrets       ${DEPLOY_DIR}/stack.env
+  OpenClaw cfg  ${DEPLOY_DIR}/openclaw/openclaw.json
+  Nginx         /etc/nginx/sites-available/n8n , /etc/nginx/sites-available/claw
+  Setup log     ${LOG_FILE}
+
+Helper command
+  sudo agentic status        what is running
+  sudo agentic open          one-click OpenClaw login
+  sudo agentic token         show your dashboard password
+  sudo agentic whatsapp      pair WhatsApp
+  sudo agentic logs n8n      live n8n logs
+  sudo agentic ssl           fix or renew SSL
+  sudo agentic safebrowsing  fix Chrome's red "Deceptive site" page
+  sudo agentic backup        back up your data
+  sudo agentic help          full list
+================================================================
+EOF
+chmod 600 "$CREDS_FILE"
+
+# =============================================================================
+#   Final report
+# =============================================================================
+print_phase "Setup finished"
+
+FAILS=0
+check() {
+    if eval "$2" >/dev/null 2>&1; then print_ok "$1"; else print_error "$1"; FAILS=$((FAILS + 1)); fi
+}
+check "Docker running"                  "systemctl is-active --quiet docker"
+check "Nginx running"                   "systemctl is-active --quiet nginx"
+check "n8n container up"                "docker inspect -f '{{.State.Running}}' n8n | grep -q true"
+check "OpenClaw container up"           "docker inspect -f '{{.State.Running}}' openclaw-gateway | grep -q true"
+check "n8n answering locally"           "curl -fsS --max-time 5 http://127.0.0.1:${N8N_PORT}/healthz"
+check "OpenClaw answering locally"      "curl -fsS --max-time 5 http://127.0.0.1:${OPENCLAW_PORT}/healthz"
+check "SSL certificate present"         "test -f /etc/letsencrypt/live/${N8N_HOSTNAME}/fullchain.pem"
+check "https://${N8N_HOSTNAME} reachable"  "curl -fsS --max-time 10 -o /dev/null https://${N8N_HOSTNAME}"
+check "https://${CLAW_HOSTNAME} reachable" "curl -fsS --max-time 10 -o /dev/null https://${CLAW_HOSTNAME}"
+
 echo ""
 separator
 echo ""
-echo -e "  ${BOLD}Useful Commands:${RESET}"
-echo "  View containers:     docker compose -f ${DEPLOY_DIR}/docker-compose.yml ps"
-echo "  View n8n logs:       docker compose -f ${DEPLOY_DIR}/docker-compose.yml logs -f n8n"
-echo "  View OpenClaw logs:  docker compose -f ${DEPLOY_DIR}/docker-compose.yml logs -f openclaw"
-echo "  Restart services:    docker compose -f ${DEPLOY_DIR}/docker-compose.yml restart"
-echo "  Stop services:       docker compose -f ${DEPLOY_DIR}/docker-compose.yml down"
-echo "  Retry SSL:           certbot --nginx --email $CERTBOT_EMAIL -d $N8N_SUBDOMAIN"
-echo "  Nginx error log:     tail -f /var/log/nginx/error.log"
+
+if [ "$FAILS" -eq 0 ]; then
+    echo "${GREEN}${BOLD}  Everything is up and healthy.${RESET}"
+else
+    echo "${YELLOW}${BOLD}  Setup completed with ${FAILS} warning(s).${RESET}"
+    print_info "Run  ${BOLD}sudo agentic status${RESET}  for details."
+fi
+
+echo ""
+echo "  ${BOLD}Your links${RESET}"
+echo "    n8n                ${CYAN}https://${N8N_HOSTNAME}${RESET}"
+echo "    OpenClaw dashboard ${CYAN}https://${CLAW_HOSTNAME}${RESET}"
+echo ""
+echo "  ${BOLD}Step 1 - n8n  (do this now, not later)${RESET}"
+echo "    Open the n8n link and create your owner account (email + password)."
+echo "    ${YELLOW}Until you do, anyone who finds the address could claim it.${RESET}"
+echo ""
+echo "  ${BOLD}Step 2 - OpenClaw dashboard${RESET}"
+echo "    Easiest:  run  ${BOLD}sudo agentic open${RESET}  and click the link it prints."
+echo "    Manual:   open the OpenClaw link and enter the dashboard password"
+echo "              you chose earlier in this setup."
+echo ""
+echo "    ${DIM}Forgot it?  sudo agentic token${RESET}"
+echo "    ${DIM}Browser says 'pairing required'?  sudo agentic approve${RESET}"
+echo ""
+echo "  ${BOLD}Step 3 - WhatsApp (when your class reaches it)${RESET}"
+echo "    ${BOLD}sudo agentic whatsapp${RESET}   then scan the QR code with your phone."
 echo ""
 separator
 echo ""
-echo -e "  ${BOLD}Channel Pairing (Day 3):${RESET}"
-echo -e "  SSH Tunnel:          ${CYAN}ssh -L 8080:127.0.0.1:8080 root@${VPS_IP}${RESET}"
-echo -e "  Dashboard:           ${CYAN}http://localhost:8080${RESET}"
-echo -e "  Pair WhatsApp:       ${CYAN}docker exec -it openclaw openclaw channels login --channel whatsapp${RESET}"
-echo -e "  Channel Status:      ${CYAN}docker exec -it openclaw openclaw channels status --probe${RESET}"
+echo "  ${BOLD}${YELLOW}If Chrome shows a red \"Deceptive site ahead\" page${RESET}"
+echo ""
+echo "    Your SSL certificate is fine - this is a Google Safe Browsing"
+echo "    false positive that self-hosted n8n gets hit with sometimes."
+echo "    ${BOLD}Click 'Details' then 'visit this unsafe site' to keep working${RESET},"
+echo "    and clear it properly like this:"
+echo ""
+echo "      1. Go to ${CYAN}https://search.google.com/search-console${RESET}"
+echo "      2. Add a ${BOLD}Domain${RESET} property for ${BOLD}${DOMAIN}${RESET}"
+echo "         ${DIM}(verify with the TXT record it gives you - covers both subdomains)${RESET}"
+echo "      3. Open ${BOLD}Security & Manual Actions -> Security Issues${RESET}"
+echo "      4. Click ${BOLD}Request Review${RESET} and say it is a private n8n"
+echo "         automation tool, not a public site"
+echo ""
+echo "    ${DIM}Reviews usually clear in 1-3 days. Run 'sudo agentic safebrowsing'${RESET}"
+echo "    ${DIM}any time to see these steps again.${RESET}"
 echo ""
 separator
 echo ""
-echo "  Config:  ${DEPLOY_DIR}/docker-compose.yml"
-echo "  Nginx:   /etc/nginx/sites-available/n8n"
+echo "  Saved to ${BOLD}${CREDS_FILE}${RESET}  -  view it any time with  ${BOLD}sudo agentic creds${RESET}"
+echo "  Manage everything with  ${BOLD}sudo agentic help${RESET}"
 echo ""
-echo -e "  ${GREEN}${BOLD}Happy building! -- CODED Agentic AI Bootcamp${RESET}"
+echo "  ${GREEN}${BOLD}Happy building - CODED Agentic AI Bootcamp${RESET}"
 echo ""
+_log "=== Setup finished with ${FAILS} warnings ==="
