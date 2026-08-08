@@ -7,7 +7,7 @@
 #   Behind:  Nginx + Let's Encrypt, Docker Compose, UFW
 #
 #   Author: Eng. Abdullah Alenezi
-#   Version: 3.2.0
+#   Version: 3.2.1
 #
 #   Safe to re-run. Every phase is idempotent.
 # =============================================================================
@@ -15,7 +15,7 @@
 set -Eeuo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
-SCRIPT_VERSION="3.2.0"
+SCRIPT_VERSION="3.2.1"
 DEPLOY_DIR="/opt/agentic-stack"
 CONF_FILE="/etc/agentic-stack.conf"
 CREDS_FILE="/root/AGENTIC-CREDENTIALS.txt"
@@ -1464,9 +1464,18 @@ cmd_approve() {
 }
 
 cmd_safebrowsing() {
-    head_ "Red \"Deceptive site ahead\" page in Chrome"
-    echo "  This is ${B}not${N} an SSL problem - your certificate is valid."
-    echo "  Google Safe Browsing sometimes false-flags self-hosted n8n."
+    head_ "Red \"Dangerous site\" page in Chrome"
+    echo "  This is ${B}not${N} an SSL problem and not a server problem."
+    echo ""
+    echo "  ${B}How to prove that to yourself:${N} open the other subdomain."
+    echo "    ${C}https://${CLAW_HOSTNAME:-claw.example.com}${N}"
+    echo "  Same certificate, same IP, same Nginx. If that one loads and"
+    echo "  ${N8N_HOSTNAME:-n8n.example.com} does not, the difference is Google's"
+    echo "  verdict on the hostname - nothing you can fix on this server."
+    echo ""
+    echo "  ${B}Why it happened:${N} a brand-new hostname serving a login or signup"
+    echo "  form (n8n's /setup page) matches the pattern Safe Browsing uses to"
+    echo "  spot phishing. Established sites do not trip it; new ones can."
     echo ""
     echo "  ${B}To keep working right now${N}"
     echo "    Click ${B}Details${N} on the red page, then ${B}visit this unsafe site${N}."
@@ -1480,8 +1489,12 @@ cmd_safebrowsing() {
     echo "    4. Click ${B}Request Review${N}. Describe it as a private automation"
     echo "       tool for your own use, not a public website."
     echo ""
-    echo "  ${B}Check your current status${N}"
+    echo "  ${B}Check the current verdict${N}"
     echo "    ${C}https://transparencyreport.google.com/safe-browsing/search?url=${N8N_HOSTNAME:-}${N}"
+    echo ""
+    echo "  ${B}Before requesting the review${N}"
+    echo "    Finish creating your n8n account first. That removes the /setup"
+    echo "    page that triggered the flag, so the reviewer does not land on it."
     echo ""
     echo "  ${B}Already done by this server to reduce the risk${N}"
     for f in \
@@ -1765,9 +1778,14 @@ echo "  ${BOLD}Your links${RESET}"
 echo "    n8n                ${CYAN}https://${N8N_HOSTNAME}${RESET}"
 echo "    OpenClaw dashboard ${CYAN}https://${CLAW_HOSTNAME}${RESET}"
 echo ""
-echo "  ${BOLD}Step 1 - n8n  (do this now, not later)${RESET}"
+echo "  ${BOLD}Step 1 - n8n  (do this first, right now)${RESET}"
 echo "    Open the n8n link and create your owner account (email + password)."
-echo "    ${YELLOW}Until you do, anyone who finds the address could claim it.${RESET}"
+echo ""
+echo "    ${YELLOW}Two reasons not to leave this for later:${RESET}"
+echo "    ${DIM}  - Until you claim it, anyone who finds the address could.${RESET}"
+echo "    ${DIM}  - The signup page looks like a phishing form to Google. The${RESET}"
+echo "    ${DIM}    longer it sits there, the more likely Chrome shows a red${RESET}"
+echo "    ${DIM}    warning on your site. Creating the account removes it.${RESET}"
 echo ""
 echo "  ${BOLD}Step 2 - OpenClaw dashboard${RESET}"
 echo ""
