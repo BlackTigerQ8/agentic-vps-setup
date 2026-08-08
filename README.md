@@ -227,6 +227,26 @@ curl -fsSL https://raw.githubusercontent.com/BlackTigerQ8/agentic-vps-setup/main
 
 ---
 
+## Starting over
+
+To wipe the stack and run the setup again from scratch — useful for recording a demo, or after a bad run:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/BlackTigerQ8/agentic-vps-setup/main/reset.sh -o reset.sh && sudo bash reset.sh
+```
+
+It asks you to type `reset` before doing anything, and `--dry-run` shows what it would remove without touching a thing.
+
+**It is deliberately surgical.** If your VPS hosts other websites, they are safe: it never touches Nginx itself, any site config it did not create, Docker Engine, other containers, firewall rules, or swap.
+
+**It keeps your SSL certificate by default, on purpose.** Let's Encrypt allows only 5 certificates per week for the same set of names. Delete and re-issue on every take and a handful of recordings will exhaust that, leaving you unable to get a certificate for up to a week. Keeping it is invisible on camera — the setup still prints *"Certificate issued"*, it just reuses the valid one. Override with `--remove-certs` only if you genuinely need to.
+
+It also keeps the downloaded container images, so the next run finishes the slow step in seconds. Use `--remove-images` if you want to show the real download time.
+
+> This does delete your n8n workflows and credentials. That is the point — but check you don't need them first.
+
+---
+
 ## Instructor notes
 
 **Pin image versions before class** so every trainee runs an identical build:
