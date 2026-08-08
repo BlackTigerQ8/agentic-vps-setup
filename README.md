@@ -17,7 +17,7 @@ Built for trainees of the CODED Agentic AI Bootcamp. Version **3.0.0**.
 
 You need three things. Do these in order.
 
-**1. A VPS** — Ubuntu 22.04 or 24.04, minimum 4 GB RAM. A fresh server is best.
+**1. A VPS** — Ubuntu 22.04 or 24.04, minimum 4 GB RAM. A fresh server is best, but the installer coexists with sites you already host: it will not take over Nginx's default host or reset firewall rules it did not create.
 
 **2. A domain** — any registrar.
 
@@ -235,6 +235,8 @@ Run the script yourself first, note the versions it pulled with `sudo agentic st
 - Ships the `agentic` helper and `diagnose.sh`
 
 **3.0.1** — upgrading in place from the old setup now preserves n8n's encryption key instead of injecting a new one (which stopped n8n from starting), and removes the dead port-8080 OpenClaw container instead of leaving it running as an orphan.
+
+**3.0.2** — works on a VPS that already hosts other websites. Previously the catch-all site claimed `default_server`, which Nginx allows only once per port, so the config test failed outright on any server with an existing site. It now detects an existing default and steps aside. UFW rules are added instead of reset for the same reason, and a rejected Nginx config is now rolled back automatically rather than left on disk.
 
 ---
 
