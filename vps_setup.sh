@@ -7,7 +7,7 @@
 #   Behind:  Nginx + Let's Encrypt, Docker Compose, UFW
 #
 #   Author: Eng. Abdullah Alenezi
-#   Version: 3.0.1
+#   Version: 3.0.2
 #
 #   Safe to re-run. Every phase is idempotent.
 # =============================================================================
@@ -15,7 +15,7 @@
 set -Eeuo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
-SCRIPT_VERSION="3.0.1"
+SCRIPT_VERSION="3.0.2"
 DEPLOY_DIR="/opt/agentic-stack"
 CONF_FILE="/etc/agentic-stack.conf"
 CREDS_FILE="/root/AGENTIC-CREDENTIALS.txt"
@@ -517,9 +517,17 @@ SSH_PORTS="$(sshd -T 2>/dev/null | awk '/^port /{print $2}' | sort -u || true)"
 [ -z "$SSH_PORTS" ] && SSH_PORTS="$(awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/{print $2}' /etc/ssh/sshd_config 2>/dev/null | sort -u || true)"
 [ -z "$SSH_PORTS" ] && SSH_PORTS="22"
 
-ufw --force reset          >/dev/null 2>&1
-ufw default deny incoming  >/dev/null 2>&1
-ufw default allow outgoing >/dev/null 2>&1
+# If UFW is already configured, this server probably runs other things too.
+# Resetting would silently close ports someone else's service depends on, so
+# only add what the stack needs and leave existing rules untouched.
+if ufw status 2>/dev/null | grep -q 'Status: active'; then
+    print_info "UFW is already active - adding our rules without touching your existing ones."
+else
+    ufw --force reset          >/dev/null 2>&1
+    ufw default deny incoming  >/dev/null 2>&1
+    ufw default allow outgoing >/dev/null 2>&1
+fi
+
 for p in $SSH_PORTS; do
     ufw allow "${p}/tcp" >/dev/null 2>&1
     print_info "Allowed SSH on port ${p}"
@@ -949,7 +957,31 @@ EOF
 # Catch-all: anything hitting the bare IP or an unknown hostname is dropped.
 # Without this, the n8n login page is served on http://<VPS_IP> to every
 # internet scanner, which is both a leak and a reputation problem.
-cat >/etc/nginx/sites-available/000-agentic-default <<EOF
+#
+# But Nginx allows exactly ONE default_server per address:port. On a VPS that
+# already hosts a website, that slot is taken, and adding a second one is a
+# fatal config error that takes the whole web server down. So: only claim it
+# if nobody else has. If another site owns it, unknown hostnames already land
+# there rather than on n8n, which is the outcome we wanted anyway.
+rm -f /etc/nginx/sites-enabled/000-agentic-default
+
+EXISTING_DEFAULT=""
+for _f in /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf; do
+    [ -e "$_f" ] || continue
+    if grep -qE '^[[:space:]]*listen[^;#]*[[:space:]]default_server' "$_f" 2>/dev/null; then
+        EXISTING_DEFAULT="$_f"
+        break
+    fi
+done
+
+if [ -n "$EXISTING_DEFAULT" ]; then
+    OWN_DEFAULT_SERVER=false
+    rm -f /etc/nginx/sites-available/000-agentic-default
+    print_info "Another site already handles unknown hostnames: $(basename "$EXISTING_DEFAULT")"
+    print_info "Leaving it alone - this server hosts more than just the bootcamp stack."
+else
+    OWN_DEFAULT_SERVER=true
+    cat >/etc/nginx/sites-available/000-agentic-default <<EOF
 server {
     listen 80 default_server;
 ${L6_80_DEF}
@@ -958,6 +990,7 @@ ${L6_80_DEF}
     location / { return 444; }
 }
 EOF
+fi
 
 write_site_http() {
     local name="$1" host="$2"
@@ -1044,14 +1077,43 @@ print_step "Writing Nginx sites ..."
 write_site_http n8n  "$N8N_HOSTNAME"
 write_site_http claw "$CLAW_HOSTNAME"
 
-rm -f /etc/nginx/sites-enabled/default
-ln -sf /etc/nginx/sites-available/000-agentic-default /etc/nginx/sites-enabled/000-agentic-default
+# Only remove the stock Debian site if we are taking over the default slot.
+# On a server hosting other websites it may be load-bearing.
+if [ "$OWN_DEFAULT_SERVER" = true ]; then
+    rm -f /etc/nginx/sites-enabled/default
+    ln -sf /etc/nginx/sites-available/000-agentic-default /etc/nginx/sites-enabled/000-agentic-default
+fi
 ln -sf /etc/nginx/sites-available/n8n  /etc/nginx/sites-enabled/n8n
 ln -sf /etc/nginx/sites-available/claw /etc/nginx/sites-enabled/claw
 
-run_step "Validating Nginx configuration" nginx -t
-run_step "Starting Nginx"                 systemctl restart nginx
-run_step "Enabling Nginx at boot"         systemctl enable nginx
+# Never leave Nginx unable to start. If our sites break the config, unlink them
+# and confirm the server is healthy again before reporting the failure.
+nginx_validate_or_rollback() {
+    local stage="$1"
+    if nginx -t >/tmp/agentic_last.log 2>&1; then
+        print_ok "Nginx configuration is valid (${stage})"
+        return 0
+    fi
+    print_error "Nginx rejected the configuration (${stage})"
+    echo ""
+    tail -n 15 /tmp/agentic_last.log
+    echo ""
+    print_step "Undoing our changes so your web server keeps working ..."
+    rm -f /etc/nginx/sites-enabled/n8n \
+          /etc/nginx/sites-enabled/claw \
+          /etc/nginx/sites-enabled/000-agentic-default
+    if nginx -t >/dev/null 2>&1; then
+        print_ok "Rolled back - Nginx is valid again and your other sites are safe"
+    else
+        print_warn "Nginx is still invalid after rollback - the problem predates this script."
+        print_info "Inspect it with:  nginx -t"
+    fi
+    die "Nginx configuration failed (${stage}). Nothing was left broken."
+}
+
+nginx_validate_or_rollback "HTTP"
+run_step "Starting Nginx"        systemctl restart nginx
+run_step "Enabling Nginx at boot" systemctl enable nginx
 print_ok "Nginx is serving HTTP for both hostnames"
 
 # =============================================================================
@@ -1109,8 +1171,8 @@ if [ "$SSL_OK" != "false" ]; then
     if [ "$SSL_OK" = true ]; then
         write_site_https claw "$CLAW_HOSTNAME" "$OPENCLAW_PORT" "50m"
     fi
-    run_step "Validating HTTPS configuration" nginx -t
-    run_step "Reloading Nginx"                systemctl reload nginx
+    nginx_validate_or_rollback "HTTPS"
+    run_step "Reloading Nginx" systemctl reload nginx
     print_ok "HTTPS is live, HTTP redirects automatically"
 fi
 
