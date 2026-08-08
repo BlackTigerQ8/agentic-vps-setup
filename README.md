@@ -151,7 +151,11 @@ The certificate did not cover the address you opened. Run `sudo agentic status` 
 
 **"Deceptive site ahead" / "Dangerous site" (a red Google page)**
 
-This is **not** an SSL problem — your certificate is valid. It's a Google Safe Browsing false positive that self-hosted n8n gets hit with periodically.
+This is **not** an SSL problem and not a server problem.
+
+**Prove it in ten seconds:** open your `claw.` subdomain. Same certificate, same IP, same Nginx. If that loads and `n8n.` doesn't, the only difference is Google's verdict on the hostname.
+
+Safe Browsing verdicts are **per-hostname**. A brand-new hostname serving a login or signup form — n8n's `/setup` page — matches the pattern its phishing classifier looks for. An n8n instance that has been running for months won't trip it; one that went live this morning can.
 
 *To keep working right now:* click **Details** on the red page, then **visit this unsafe site**.
 
@@ -161,6 +165,8 @@ This is **not** an SSL problem — your certificate is valid. It's a Google Safe
 2. Add a **Domain** property for `yourdomain.com` (not a URL-prefix property — a Domain property covers both subdomains at once). Verify it with the TXT record it gives you.
 3. Go to **Security & Manual Actions → Security Issues**
 4. Click **Request Review**. Describe it as a private automation tool for your own use, not a public website.
+
+Before requesting the review, **finish creating your n8n account** — that removes the `/setup` page that triggered the flag, so the reviewer doesn't land on it.
 
 Reviews usually clear in 1–3 days. Check the current verdict any time at [Google's Transparency Report](https://transparencyreport.google.com/safe-browsing/search).
 
