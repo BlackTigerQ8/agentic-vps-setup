@@ -7,7 +7,7 @@
 #   Behind:  Nginx + Let's Encrypt, Docker Compose, UFW
 #
 #   Author: Eng. Abdullah Alenezi
-#   Version: 3.1.0
+#   Version: 3.2.0
 #
 #   Safe to re-run. Every phase is idempotent.
 # =============================================================================
@@ -15,7 +15,7 @@
 set -Eeuo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
-SCRIPT_VERSION="3.1.0"
+SCRIPT_VERSION="3.2.0"
 DEPLOY_DIR="/opt/agentic-stack"
 CONF_FILE="/etc/agentic-stack.conf"
 CREDS_FILE="/root/AGENTIC-CREDENTIALS.txt"
@@ -402,10 +402,10 @@ fi
 echo ""
 separator
 echo ""
-echo "  ${BOLD}OpenClaw dashboard password${RESET}"
-print_info "You will type this into https://${CLAW_HOSTNAME} to open your dashboard."
-print_info "OpenClaw calls it the 'gateway token'. Choose something you will remember."
-print_warn "This dashboard is reachable from the internet - do not use a short or obvious password."
+echo "  ${BOLD}OpenClaw dashboard token${RESET}"
+print_info "You will paste this into the box labelled 'Gateway Token' at"
+print_info "https://${CLAW_HOSTNAME} . Choose something you will remember."
+print_warn "This dashboard is reachable from the internet - do not use a short or obvious value."
 echo ""
 
 EXISTING_TOKEN=""
@@ -1398,7 +1398,7 @@ cat <<EOF
 
   ${B}OpenClaw${N}
     agentic whatsapp          Pair WhatsApp (shows the QR code)
-    agentic approve           Approve a device waiting to log in
+    agentic approve [id]      Approve this browser for the dashboard
     agentic model [ref]       List or change the AI model
     agentic doctor            Run OpenClaw self-repair
     agentic claw <args...>    Run any raw OpenClaw CLI command
@@ -1422,13 +1422,44 @@ cmd_urls() {
 
 cmd_token() {
     local t; t="$(token)"
-    head_ "Your OpenClaw dashboard password"
-    if [ -z "$t" ]; then bad "No password found in ${DEPLOY_DIR}/stack.env"; return 1; fi
+    head_ "Your OpenClaw dashboard token"
+    if [ -z "$t" ]; then bad "No token found in ${DEPLOY_DIR}/stack.env"; return 1; fi
     echo "  ${B}${t}${N}"
     echo ""
-    info "This is the password you chose during setup."
-    info "OpenClaw's dashboard calls it the 'gateway token'."
+    echo "  ${B}Paste it into the field labelled 'Gateway Token'${N} - the FIRST box."
+    echo "  ${B}Leave the 'Password' box empty.${N}"
+    echo ""
+    info "The dashboard shows both boxes because a gateway can use either one."
+    info "This server is set up for token auth, so only the top box is used."
     info "Dashboard: https://${CLAW_HOSTNAME:-claw.example.com}"
+    echo ""
+}
+
+cmd_approve() {
+    head_ "Approve this browser"
+    if [ -n "${1:-}" ]; then
+        if oc devices approve "$1"; then
+            ok "Approved."
+            echo ""
+            echo "  Go back to the dashboard tab and click ${B}Connect${N} again."
+            echo ""
+        else
+            bad "Could not approve '$1'"
+            info "Check the ID and try again, or run: sudo agentic claw devices list"
+        fi
+        return
+    fi
+    echo "  The dashboard shows a line like:"
+    echo ""
+    echo "    ${D}Approve this request: openclaw devices approve ${N}${B}bf53a0d8-c6c4-4835-...${N}"
+    echo ""
+    echo "  Copy that ID and run:"
+    echo ""
+    echo "    ${C}sudo agentic approve <paste-the-id-here>${N}"
+    echo ""
+    info "Devices currently known to the gateway:"
+    echo ""
+    oc devices list || true
     echo ""
 }
 
@@ -1468,18 +1499,38 @@ cmd_open() {
     head_ "One-click dashboard login"
     local out url
     out="$(oc_q dashboard --no-open 2>&1 || true)"
-    url="$(printf '%s' "$out" | grep -Eo 'https?://[^[:space:]]+' | head -n1)"
-    if [ -n "$url" ] && [ -n "${CLAW_HOSTNAME:-}" ]; then
-        url="$(printf '%s' "$url" | sed -E "s#https?://(127\.0\.0\.1|localhost|0\.0\.0\.0)(:[0-9]+)?#https://${CLAW_HOSTNAME}#")"
-        echo "  Open this link in your browser (valid once, expires quickly):"
+
+    # The bootstrap link carries a one-time code, so it always has a query
+    # string. A bare origin is the plain dashboard address, not a grant -
+    # taking the first URL blindly hands the user a link that cannot log in.
+    url="$(printf '%s' "$out" \
+        | grep -Eo 'https?://[^[:space:]]+' \
+        | grep -E '\?|code=|token=|pair' \
+        | tail -n1 || true)"
+
+    if [ -z "$url" ]; then
+        warn "OpenClaw did not return a one-time login link."
         echo ""
-        echo "  ${C}${url}${N}"
+        echo "  ${B}Raw output from OpenClaw:${N}"
         echo ""
-    else
-        warn "Could not generate a one-time link."
-        info "Use the token instead:  sudo agentic token"
-        [ -n "$out" ] && { echo ""; echo "$out"; }
+        printf '%s\n' "${out:-(no output)}" | sed 's/^/    /'
+        echo ""
+        info "Log in manually instead:"
+        info "  1. Open https://${CLAW_HOSTNAME:-claw.example.com}"
+        info "  2. Paste your token into the 'Gateway Token' box (sudo agentic token)"
+        info "  3. Click Connect. If it says pairing is required, copy the ID it shows"
+        info "     and run:  sudo agentic approve <that-id>"
+        echo ""
+        return 1
     fi
+
+    [ -n "${CLAW_HOSTNAME:-}" ] && url="$(printf '%s' "$url" \
+        | sed -E "s#https?://(127\.0\.0\.1|localhost|0\.0\.0\.0)(:[0-9]+)?#https://${CLAW_HOSTNAME}#")"
+
+    echo "  Open this link in your browser (valid once, expires quickly):"
+    echo ""
+    echo "  ${C}${url}${N}"
+    echo ""
 }
 
 cmd_status() {
@@ -1599,11 +1650,7 @@ case "${1:-help}" in
               info "A QR code will appear. Scan it with: WhatsApp > Settings > Linked devices > Link a device"
               echo ""
               oc channels login --channel whatsapp ;;
-    approve)  head_ "Devices waiting for approval"
-              oc devices list
-              echo ""
-              read -rp "  Request ID to approve (Enter to skip): " rid
-              [ -n "${rid:-}" ] && oc devices approve "$rid" ;;
+    approve)  shift; cmd_approve "${1:-}" ;;
     claw)     shift; oc "$@" ;;
     logs)     case "${2:-all}" in
                   n8n)  dc logs -f --tail=100 n8n ;;
@@ -1646,9 +1693,18 @@ n8n
 
 OpenClaw dashboard
   URL          https://${CLAW_HOSTNAME}
-  Password     the one YOU chose during setup (OpenClaw calls it a
-               "gateway token"). Forgotten it?  sudo agentic token
-  Easiest login:  sudo agentic open      (one-click, no typing)
+  Token        ${OPENCLAW_GATEWAY_TOKEN}
+
+  First login (one time only):
+    1. Open the URL above
+    2. Paste the token into the "Gateway Token" box (the first one)
+       Leave the "Password" box empty
+    3. Click Connect -> it says "Device pairing required" and shows an ID
+    4. On the server:  sudo agentic approve <that-id>
+    5. Click Connect again in the browser
+
+  Every login after that is automatic in this browser.
+  A different browser or phone repeats steps 3-5 once.
 
 AI provider     ${AI_LABEL}
 AI model        ${AI_MODEL:-not set yet - run: sudo agentic model}
@@ -1714,12 +1770,30 @@ echo "    Open the n8n link and create your owner account (email + password)."
 echo "    ${YELLOW}Until you do, anyone who finds the address could claim it.${RESET}"
 echo ""
 echo "  ${BOLD}Step 2 - OpenClaw dashboard${RESET}"
-echo "    Easiest:  run  ${BOLD}sudo agentic open${RESET}  and click the link it prints."
-echo "    Manual:   open the OpenClaw link and enter the dashboard password"
-echo "              you chose earlier in this setup."
 echo ""
-echo "    ${DIM}Forgot it?  sudo agentic token${RESET}"
-echo "    ${DIM}Browser says 'pairing required'?  sudo agentic approve${RESET}"
+echo "    ${YELLOW}OpenClaw asks you to approve your browser once, the first time${RESET}"
+echo "    ${YELLOW}you log in. This is normal and it only happens once.${RESET}"
+echo "    ${DIM}Follow these five steps in order and keep this window open.${RESET}"
+echo ""
+echo "    ${BOLD}1.${RESET} Open  ${CYAN}https://${CLAW_HOSTNAME}${RESET}"
+echo ""
+echo "    ${BOLD}2.${RESET} Paste this into the box labelled ${BOLD}Gateway Token${RESET} (the first box):"
+echo ""
+echo "         ${BOLD}${OPENCLAW_GATEWAY_TOKEN}${RESET}"
+echo ""
+echo "       Leave the ${BOLD}Password${RESET} box empty."
+echo ""
+echo "    ${BOLD}3.${RESET} Click ${BOLD}Connect${RESET}. It will say ${BOLD}\"Device pairing required\"${RESET}"
+echo "       and show a long ID like ${DIM}63c13fd2-5cde-49d5-a792-d03b323e40a9${RESET}"
+echo ""
+echo "    ${BOLD}4.${RESET} Copy that ID, come back to this window, and run:"
+echo ""
+echo "         ${BOLD}sudo agentic approve${RESET} ${DIM}<paste-the-id-here>${RESET}"
+echo ""
+echo "    ${BOLD}5.${RESET} Go back to the browser and click ${BOLD}Connect${RESET} again. You are in."
+echo ""
+echo "    ${DIM}Do step 4 straight after step 3 - the ID expires.${RESET}"
+echo "    ${DIM}Lost the token?  sudo agentic token${RESET}"
 echo ""
 echo "  ${BOLD}Step 3 - WhatsApp (when your class reaches it)${RESET}"
 echo "    ${BOLD}sudo agentic whatsapp${RESET}   then scan the QR code with your phone."

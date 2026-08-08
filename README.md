@@ -64,19 +64,29 @@ Open `https://n8n.yourdomain.com` and create your account on the first screen. n
 
 ### OpenClaw dashboard
 
-Open `https://claw.yourdomain.com` and enter **the dashboard password you chose during setup**. OpenClaw's screen calls it a *gateway token* — it's the same thing.
+Your first login takes five steps. **This happens once per browser** — after that it's automatic.
 
-Forgotten it?
+OpenClaw requires every browser to be approved by the gateway before it can use the dashboard. This cannot be turned off; it's how OpenClaw is built. Auto-approval exists only for `role: node` devices, [never for browsers](https://github.com/openclaw/openclaw/blob/main/docs/gateway/pairing.md).
+
+**1.** Open `https://claw.yourdomain.com`
+
+**2.** Paste your token into the box labelled **Gateway Token** — the *first* box. **Leave the "Password" box empty.** The dashboard shows both boxes because a gateway can be set up either way; this one uses token auth, so only the top box is read.
 
 ```bash
 sudo agentic token
 ```
 
-Or skip typing entirely — this prints a one-time link that logs you straight in:
+**3.** Click **Connect**. It will say *"Device pairing required"* and show a long ID like `63c13fd2-5cde-49d5-a792-d03b323e40a9`.
+
+**4.** Copy that ID and run, on the server:
 
 ```bash
-sudo agentic open
+sudo agentic approve 63c13fd2-5cde-49d5-a792-d03b323e40a9
 ```
+
+**5.** Back in the browser, click **Connect** again. You're in.
+
+> Do step 4 straight after step 3. The ID expires, and retrying in the browser replaces it with a new one — so an ID you copied earlier will no longer work.
 
 If the browser says **"pairing required"**, approve the device:
 
@@ -113,7 +123,7 @@ sudo agentic help
 | `agentic logs claw` | Follow OpenClaw logs live |
 | `agentic restart` | Restart everything |
 | `agentic whatsapp` | Pair WhatsApp |
-| `agentic approve` | Approve a device waiting to log in |
+| `agentic approve [id]` | Approve your browser for the dashboard |
 | `agentic model` | List or change the AI model |
 | `agentic doctor` | OpenClaw self-repair |
 | `agentic ssl` | Issue or renew the certificate |
@@ -235,6 +245,10 @@ Run the script yourself first, note the versions it pulled with `sudo agentic st
 - Ships the `agentic` helper and `diagnose.sh`
 
 **3.0.1** — upgrading in place from the old setup now preserves n8n's encryption key instead of injecting a new one (which stopped n8n from starting), and removes the dead port-8080 OpenClaw container instead of leaving it running as an orphan.
+
+**3.2.0** — the first dashboard login is now spelled out as five numbered steps in the setup output and the credentials file, including the token itself and the pairing command. OpenClaw requires a one-time browser approval that cannot be configured away, so the setup states it plainly instead of implying a one-click route that does not exist.
+
+**3.1.1** — clearer dashboard login. The setup called its value a "password", which led people to type it into the dashboard's *Password* box; it belongs in **Gateway Token**. Wording corrected everywhere, `agentic open` is now presented as the primary route, and `agentic approve` takes the pairing ID as an argument instead of prompting for it.
 
 **3.1.0** — every long step now shows a spinner, a running clock, and (during the image download) the line Docker is currently working on. Previously the 2–8 minute pull and the readiness waits printed nothing at all, which reads as a frozen script to anyone who hasn't used a terminal before.
 
