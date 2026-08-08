@@ -236,6 +236,8 @@ Run the script yourself first, note the versions it pulled with `sudo agentic st
 
 **3.0.1** — upgrading in place from the old setup now preserves n8n's encryption key instead of injecting a new one (which stopped n8n from starting), and removes the dead port-8080 OpenClaw container instead of leaving it running as an orphan.
 
+**3.1.0** — every long step now shows a spinner, a running clock, and (during the image download) the line Docker is currently working on. Previously the 2–8 minute pull and the readiness waits printed nothing at all, which reads as a frozen script to anyone who hasn't used a terminal before.
+
 **3.0.2** — works on a VPS that already hosts other websites. Previously the catch-all site claimed `default_server`, which Nginx allows only once per port, so the config test failed outright on any server with an existing site. It now detects an existing default and steps aside. UFW rules are added instead of reset for the same reason, and a rejected Nginx config is now rolled back automatically rather than left on disk.
 
 ---

@@ -7,7 +7,7 @@
 #   Behind:  Nginx + Let's Encrypt, Docker Compose, UFW
 #
 #   Author: Eng. Abdullah Alenezi
-#   Version: 3.0.2
+#   Version: 3.1.0
 #
 #   Safe to re-run. Every phase is idempotent.
 # =============================================================================
@@ -15,7 +15,7 @@
 set -Eeuo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
-SCRIPT_VERSION="3.0.2"
+SCRIPT_VERSION="3.1.0"
 DEPLOY_DIR="/opt/agentic-stack"
 CONF_FILE="/etc/agentic-stack.conf"
 CREDS_FILE="/root/AGENTIC-CREDENTIALS.txt"
@@ -152,35 +152,72 @@ _spin_stop() {
 }
 trap '_spin_stop' EXIT
 
-run_step() {
-    # run_step "Message" cmd args...
-    local msg="$1"; shift
-    if [ -t 1 ]; then
-        (
-            local chars='|/-\' i=0
-            while :; do
-                printf "\r  ${BLUE}%s${RESET} %s " "${chars:$((i % 4)):1}" "$msg"
-                sleep 0.15
-                i=$(( (i + 1) % 4 ))
-            done
-        ) &
-        _spin_pid=$!
-    else
+# A spinner with a running clock. The clock matters more than the spinner: a
+# non-technical user watching a still terminal assumes it has frozen and kills
+# it. Ticking seconds are unambiguous proof that work is happening.
+#
+# WATCH_LOG=1 additionally shows the tail of the command's own output, so long
+# downloads report what they are actually doing.
+_spin_start() {
+    local msg="$1" watch="${2:-}"
+    if [ ! -t 1 ]; then
         printf "  > %s\n" "$msg"
+        return
     fi
+    (
+        local frames='|/-\' i=0 t0=$SECONDS el detail=""
+        while :; do
+            el=$(( SECONDS - t0 ))
+            if [ -n "$watch" ] && [ -s /tmp/agentic_last.log ]; then
+                # Last non-blank line, trimmed to keep the display on one row.
+                detail="$(tr -d '\r' </tmp/agentic_last.log | grep -v '^[[:space:]]*$' | tail -n1 | cut -c1-46 || true)"
+                [ -n "$detail" ] && detail="  ${DIM}${detail}${RESET}"
+            fi
+            printf "\r\033[K  ${BLUE}%s${RESET} %s  ${DIM}[%02d:%02d]${RESET}%s" \
+                   "${frames:$((i % 4)):1}" "$msg" "$((el / 60))" "$((el % 60))" "$detail"
+            sleep 0.2
+            i=$(( i + 1 ))
+        done
+    ) &
+    _spin_pid=$!
+}
 
+_spin_clear() { [ -t 1 ] && printf "\r\033[K" || true; }
+
+_run() {
+    # _run <watch> "Message" cmd args...  -> echoes nothing, returns exit code
+    local watch="$1" msg="$2"; shift 2
+    : >/tmp/agentic_last.log
+    _spin_start "$msg" "$watch"
     local rc=0
     "$@" >/tmp/agentic_last.log 2>&1 || rc=$?
     _spin_stop
-    [ -t 1 ] && printf "\r\033[K"
+    _spin_clear
+    return "$rc"
+}
 
-    if [ "$rc" -eq 0 ]; then
-        print_ok "$msg"
-        _log "CMD OK: $*"
-        return 0
+run_step() {
+    # run_step "Message" cmd args...   - aborts the script on failure
+    local msg="$1"; shift
+    if _run "" "$msg" "$@"; then
+        print_ok "$msg"; _log "CMD OK: $*"; return 0
     fi
     print_error "$msg"
-    _log "CMD FAIL ($rc): $*"
+    _log "CMD FAIL: $*"
+    echo ""
+    tail -n 30 /tmp/agentic_last.log
+    echo ""
+    die "Step failed: ${msg}"
+}
+
+run_watch() {
+    # Like run_step, but streams the command's own progress beside the clock.
+    local msg="$1"; shift
+    if _run 1 "$msg" "$@"; then
+        print_ok "$msg"; _log "CMD OK: $*"; return 0
+    fi
+    print_error "$msg"
+    _log "CMD FAIL: $*"
     echo ""
     tail -n 30 /tmp/agentic_last.log
     echo ""
@@ -190,11 +227,35 @@ run_step() {
 run_soft() {
     # Same as run_step but never aborts the script.
     local msg="$1"; shift
-    local rc=0
-    "$@" >/tmp/agentic_last.log 2>&1 || rc=$?
-    if [ "$rc" -eq 0 ]; then print_ok "$msg"; return 0; fi
+    if _run "" "$msg" "$@"; then print_ok "$msg"; return 0; fi
     print_warn "${msg} - skipped (non-fatal)"
-    _log "SOFT FAIL ($rc): $*"
+    _log "SOFT FAIL: $*"
+    return 1
+}
+
+# Poll a URL until it answers, showing the same clock. Replaces silent
+# `for ... sleep` loops that looked identical to a hung script.
+wait_for_http() {
+    # wait_for_http "Message" URL [max_seconds]
+    local msg="$1" url="$2" max="${3:-180}"
+    local t0=$SECONDS frames='|/-\' i=0 el
+    while :; do
+        el=$(( SECONDS - t0 ))
+        [ "$el" -ge "$max" ] && break
+        if [ $(( i % 10 )) -eq 0 ] && curl -fsS --max-time 3 "$url" >/dev/null 2>&1; then
+            _spin_clear
+            print_ok "$msg"
+            return 0
+        fi
+        if [ -t 1 ]; then
+            printf "\r\033[K  ${BLUE}%s${RESET} %s  ${DIM}[%02d:%02d of %02d:%02d]${RESET}" \
+                   "${frames:$((i % 4)):1}" "$msg" \
+                   "$((el / 60))" "$((el % 60))" "$((max / 60))" "$((max % 60))"
+        fi
+        i=$(( i + 1 ))
+        sleep 0.2
+    done
+    _spin_clear
     return 1
 }
 
@@ -560,23 +621,38 @@ if [ -f /proc/net/if_inet6 ] && ip -6 addr show scope global 2>/dev/null | grep 
 fi
 
 wait_for_dns() {
-    local host="$1" tries=0 max=40 got=""
-    while [ "$tries" -lt "$max" ]; do
-        if dns_ready "$host"; then
-            print_ok "${host} -> ${VPS_IP}"
-            return 0
+    # Redraws five times a second so the line visibly moves, but only queries
+    # DNS every five seconds. A counter that sits still for 15 seconds reads as
+    # a hung script to anyone who has not seen a terminal before.
+    local host="$1" max="${2:-600}"
+    local t0=$SECONDS frames='|/-\' i=0 el got="" warned=false
+    while :; do
+        el=$(( SECONDS - t0 ))
+        [ "$el" -ge "$max" ] && break
+        if [ $(( i % 25 )) -eq 0 ]; then
+            if dns_ready "$host"; then
+                _spin_clear
+                print_ok "${host} -> ${VPS_IP}"
+                return 0
+            fi
+            if [ "$warned" = false ]; then
+                got="$(resolve_a "$host")" || true
+                _spin_clear
+                print_warn "${host} points to '${got:-nothing}' but should point to ${VPS_IP}"
+                print_info "Waiting for the DNS record to spread. This usually takes 1-30 minutes."
+                print_info "Leave this running. It will continue by itself as soon as DNS is ready."
+                warned=true
+            fi
         fi
-        got="$(resolve_a "$host")" || true
-        if [ "$tries" -eq 0 ]; then
-            print_warn "${host} resolves to '${got:-nothing}' but should be ${VPS_IP}"
-            print_info "Waiting for DNS to propagate. This takes 1-30 minutes."
-            print_info "Press Ctrl+C to abort, fix the DNS record, and re-run this script."
+        if [ -t 1 ]; then
+            printf "\r\033[K  ${BLUE}%s${RESET} Waiting for DNS: %s  ${DIM}[%02d:%02d of %02d:%02d]${RESET}" \
+                   "${frames:$((i % 4)):1}" "$host" \
+                   "$((el / 60))" "$((el % 60))" "$((max / 60))" "$((max % 60))"
         fi
-        printf "\r  ${DIM}waiting for %s ... %d/%d${RESET}   " "$host" "$((tries + 1))" "$max"
-        sleep 15
-        tries=$((tries + 1))
+        i=$(( i + 1 ))
+        sleep 0.2
     done
-    printf "\r\033[K"
+    _spin_clear
     return 1
 }
 
@@ -1199,46 +1275,31 @@ print_phase "PHASE 8 / 9  --  Starting n8n and OpenClaw"
 
 cd "$DEPLOY_DIR"
 
-print_step "Downloading container images (this is the slowest step, 2-5 minutes) ..."
-if ! docker compose pull n8n openclaw-gateway >/tmp/agentic_last.log 2>&1; then
+echo "  ${BOLD}${YELLOW}This next step downloads about 1.5 GB and is the slowest part.${RESET}"
+echo "  ${BOLD}${YELLOW}It can take 2-8 minutes. Leave this window open.${RESET}"
+echo "  ${DIM}The timer and the line beside it keep moving while it works.${RESET}"
+echo ""
+
+# First attempt must not abort - there is a mirror to fall back to.
+if _run 1 "Downloading container images" docker compose pull n8n openclaw-gateway; then
+    print_ok "Container images downloaded"
+else
     print_warn "ghcr.io pull failed. Falling back to the Docker Hub mirror for OpenClaw."
     sed -i "s|ghcr.io/openclaw/openclaw:|openclaw/openclaw:|g" docker-compose.yml
-    run_step "Downloading images (mirror)" docker compose pull n8n openclaw-gateway
-else
-    print_ok "Images downloaded"
+    run_watch "Downloading container images (mirror)" docker compose pull n8n openclaw-gateway
 fi
 
 run_step "Starting containers" docker compose up -d n8n openclaw-gateway
 
-# --- Wait for n8n ---
-print_step "Waiting for n8n to become ready ..."
 n8n_up=false
-for _ in $(seq 1 60); do
-    if curl -fsS --max-time 3 "http://127.0.0.1:${N8N_PORT}/healthz" >/dev/null 2>&1; then
-        n8n_up=true; break
-    fi
-    sleep 3
-done
-if [ "$n8n_up" = true ]; then
-    print_ok "n8n is responding on port ${N8N_PORT}"
-else
-    print_warn "n8n did not answer within 3 minutes. Check:  agentic logs n8n"
-fi
+wait_for_http "Waiting for n8n to start" "http://127.0.0.1:${N8N_PORT}/healthz" 180 \
+    && n8n_up=true \
+    || print_warn "n8n did not answer within 3 minutes. Check:  agentic logs n8n"
 
-# --- Wait for OpenClaw ---
-print_step "Waiting for the OpenClaw gateway to become ready ..."
 oc_up=false
-for _ in $(seq 1 60); do
-    if curl -fsS --max-time 3 "http://127.0.0.1:${OPENCLAW_PORT}/healthz" >/dev/null 2>&1; then
-        oc_up=true; break
-    fi
-    sleep 3
-done
-if [ "$oc_up" = true ]; then
-    print_ok "OpenClaw gateway is responding on port ${OPENCLAW_PORT}"
-else
-    print_warn "OpenClaw did not answer within 3 minutes. Check:  agentic logs claw"
-fi
+wait_for_http "Waiting for the OpenClaw gateway to start" "http://127.0.0.1:${OPENCLAW_PORT}/healthz" 180 \
+    && oc_up=true \
+    || print_warn "OpenClaw did not answer within 3 minutes. Check:  agentic logs claw"
 
 # =============================================================================
 #   PHASE 9 - OpenClaw bootstrap + helper command
@@ -1283,11 +1344,9 @@ if [ "$oc_up" = true ]; then
     run_step "Restarting OpenClaw so plugins and settings load" \
         docker compose -f "${DEPLOY_DIR}/docker-compose.yml" restart openclaw-gateway
 
-    for _ in $(seq 1 40); do
-        curl -fsS --max-time 3 "http://127.0.0.1:${OPENCLAW_PORT}/healthz" >/dev/null 2>&1 && break
-        sleep 3
-    done
-    print_ok "OpenClaw restarted"
+    wait_for_http "Waiting for OpenClaw to come back up" \
+        "http://127.0.0.1:${OPENCLAW_PORT}/healthz" 120 \
+        || print_warn "OpenClaw is slow to restart. Check:  agentic status"
 else
     print_warn "Skipping OpenClaw configuration because the gateway is not responding yet."
     print_info "Once it is up, run:  agentic doctor"
