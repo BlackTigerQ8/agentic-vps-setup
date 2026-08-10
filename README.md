@@ -118,6 +118,22 @@ This is agent-driven, not a hard trigger: OpenClaw's model decides whether an in
 
 Runs independently of `vps_setup.sh` and the `agentic` helper — no need to re-run setup to get this.
 
+### Voice replies and voice notes on WhatsApp
+
+Want OpenClaw to understand a voice note you send it, and reply back with a spoken voice note instead of typed text? Another standalone script, same family as `connect_n8n.sh`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/BlackTigerQ8/agentic-vps-setup/main/connect_elevenlabs.sh -o connect_elevenlabs.sh && sudo bash connect_elevenlabs.sh
+```
+
+Three questions: your [ElevenLabs](https://elevenlabs.io) API key, a voice ID (optional — leave blank to use your account's default voice), and whether to echo the transcript of incoming voice notes into the chat alongside OpenClaw's response (handy for a bootcamp demo, easy to say no to). It validates the config against OpenClaw's schema before restarting the gateway, so a bad value gets caught before anything reloads broken.
+
+**This is a hard switch, not agent judgment** — unlike the n8n skill, every WhatsApp reply becomes a spoken voice note once this is on, all the time. If that's too much, dial it back manually: `sudo docker exec openclaw-gateway openclaw config set tts.auto never`.
+
+Voice notes *in* use OpenClaw's own built-in audio understanding, not ElevenLabs — there's no separate setup needed for that half, this script just switches it on.
+
+**Changed your mind about the voice, or your key?** Run the script again — it overwrites cleanly, nothing to remove first.
+
 ---
 
 ## The `agentic` command
@@ -275,6 +291,8 @@ AGENTIC_N8N_TAG=1.130.0 AGENTIC_OPENCLAW_TAG=2026.7.1 sudo -E bash vps_setup.sh
 Run the script yourself first, note the versions it pulled with `sudo agentic status`, and give trainees that command. This removes a whole class of "it worked for her but not for me" problems.
 
 **`connect_n8n.sh` — new, standalone.** Wires a WhatsApp message to an n8n workflow via an OpenClaw skill, without hand-authoring markdown or running `docker exec`. It's deliberately its own script rather than a `vps_setup.sh`/`agentic` addition — it works on any server already built, needs no re-run of setup, and can't put the stack's core scripts at risk while it's iterated on. Ships this way because OpenClaw has no GUI and no deterministic "every message forwards" mechanism for this (checked against the live CLI: `webhooks` only handles Gmail, `hooks` fires on lifecycle events like `/new`/`/reset`, not incoming messages) — the only real integration path is an agent skill, which means this is judgment-based, not a hard trigger. Test with an unambiguous message first.
+
+**`connect_elevenlabs.sh` — new, standalone.** Turns on ElevenLabs voice replies and voice-note understanding via `openclaw config set`, same non-`vps_setup.sh` reasoning as above. Unlike the n8n skill, this one is a hard switch (`tts.auto: "always"`) — every reply becomes a spoken voice note, no model judgment involved, so try it before deciding it's the right default for a whole class. Two field names (`speakerVoiceId`, `model`) were confirmed against `openclaw config schema` directly rather than trusted from docs — two independent doc pages disagreed with each other on those exact names.
 
 **What changed in 3.0.0**
 
