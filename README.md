@@ -102,6 +102,22 @@ sudo agentic whatsapp
 
 A QR code appears in your terminal. On your phone: **WhatsApp → Settings → Linked devices → Link a device**, then scan.
 
+### Triggering an n8n workflow from WhatsApp
+
+Built an n8n workflow you want WhatsApp messages to trigger — one with a Webhook node as its start? Connect it with a separate, standalone script:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/BlackTigerQ8/agentic-vps-setup/main/connect_n8n.sh -o connect_n8n.sh && sudo bash connect_n8n.sh
+```
+
+It asks three questions: the workflow's **production** webhook URL (the `/webhook/...` one — it warns you if you paste the one-shot `/webhook-test/...` URL by mistake), the Header Auth key from that Webhook node, and a one-sentence description of what the workflow does. That description matters — it's what tells OpenClaw *when* to hand a message to it, so be specific ("search the web and save results as a Google Doc, Sheet, or Calendar event," not "does stuff"). It shows you everything before writing anything, so you can back out at either prompt.
+
+**Built a different workflow later, or changed this one?** Run the script again with the new details — it safely replaces the old configuration, nothing to remove first.
+
+This is agent-driven, not a hard trigger: OpenClaw's model decides whether an incoming message matches your description before it calls your workflow. Send an unambiguous test message first before trying anything ambiguous.
+
+Runs independently of `vps_setup.sh` and the `agentic` helper — no need to re-run setup to get this.
+
 ---
 
 ## The `agentic` command
@@ -198,6 +214,7 @@ It is on port **18789**, not 8080. You do not need an SSH tunnel — use `https:
 | `/root/AGENTIC-CREDENTIALS.txt` | Your links and tokens |
 | `/var/log/agentic-setup.log` | Full setup transcript |
 | `/etc/agentic-stack.conf` | Saved answers, reused on re-runs |
+| `/opt/agentic-stack/openclaw-workspace/n8n-automation/SKILL.md` | Written by `connect_n8n.sh` |
 
 ---
 
@@ -256,6 +273,8 @@ AGENTIC_N8N_TAG=1.130.0 AGENTIC_OPENCLAW_TAG=2026.7.1 sudo -E bash vps_setup.sh
 ```
 
 Run the script yourself first, note the versions it pulled with `sudo agentic status`, and give trainees that command. This removes a whole class of "it worked for her but not for me" problems.
+
+**`connect_n8n.sh` — new, standalone.** Wires a WhatsApp message to an n8n workflow via an OpenClaw skill, without hand-authoring markdown or running `docker exec`. It's deliberately its own script rather than a `vps_setup.sh`/`agentic` addition — it works on any server already built, needs no re-run of setup, and can't put the stack's core scripts at risk while it's iterated on. Ships this way because OpenClaw has no GUI and no deterministic "every message forwards" mechanism for this (checked against the live CLI: `webhooks` only handles Gmail, `hooks` fires on lifecycle events like `/new`/`/reset`, not incoming messages) — the only real integration path is an agent skill, which means this is judgment-based, not a hard trigger. Test with an unambiguous message first.
 
 **What changed in 3.0.0**
 
