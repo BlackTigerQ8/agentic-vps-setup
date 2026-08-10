@@ -208,8 +208,11 @@ done
 [ "$up" = true ] && ok "OpenClaw is back up" || warn "OpenClaw is slow to come back. Check:  sudo agentic status"
 
 # =============================================================================
-sect "Turning on voice notes in"
+sect "Turning on voice notes in and the sag skill"
 
+# There is no `openclaw skills enable` command - skills are bundled but
+# disabled by default, and turned on the same way everything else is:
+# a config path, confirmed against the live schema (skills.entries.<name>.enabled).
 if oc_q config set tools.media.audio.enabled true >/tmp/connect_11labs_last.log 2>&1; then
     ok "Audio understanding enabled"
 else
@@ -223,17 +226,41 @@ if [ "$echo_transcript" = true ]; then
         || warn "Could not enable transcript echo - continuing anyway"
 fi
 
-# =============================================================================
-sect "Turning on the sag skill"
-
-if oc_q skills enable sag >/tmp/connect_11labs_last.log 2>&1; then
+if oc_q config set skills.entries.sag.enabled true >/tmp/connect_11labs_last.log 2>&1; then
     ok "sag skill enabled"
 else
     bad "Could not enable the sag skill"
     tail -n 20 /tmp/connect_11labs_last.log
+    die "Stopped here - the earlier steps (image, keys) are still saved, just this switch didn't flip."
 fi
 
-step "Checking it's actually ready ..."
+step "Checking the config is still valid ..."
+if oc_q config validate >/tmp/connect_11labs_last.log 2>&1; then
+    ok "Config is valid"
+else
+    bad "Config validation failed"
+    tail -n 30 /tmp/connect_11labs_last.log
+    die "Something above isn't right - fix it before relying on this."
+fi
+
+step "Restarting so the config changes actually take effect ..."
+dc restart openclaw-gateway >/tmp/connect_11labs_last.log 2>&1 || {
+    bad "Restart failed"
+    tail -n 20 /tmp/connect_11labs_last.log
+    die "Check:  sudo agentic logs claw"
+}
+
+t0=$SECONDS
+up=false
+while [ $((SECONDS - t0)) -lt 60 ]; do
+    if curl -fsS --max-time 3 "http://127.0.0.1:18789/healthz" >/dev/null 2>&1; then
+        up=true; break
+    fi
+    sleep 2
+done
+[ "$up" = true ] && ok "OpenClaw is back up" || warn "OpenClaw is slow to come back. Check:  sudo agentic status"
+
+step "Checking sag is actually ready ..."
 oc skills info sag
 
 # =============================================================================
