@@ -103,7 +103,7 @@ while [ -z "$key" ]; do
     echo ""
 done
 
-default_desc="Search the web and save results as a Google Doc, Sheet, or Calendar event"
+default_desc="Look up information, facts, recommendations, or research on any topic - always save the results as a real Google Doc, Sheet, or Calendar event in the user's Google account, never as a local file"
 read -rp "  ${CYAN}?${RESET} In one sentence, what does this workflow do? [${default_desc}]: " desc || true
 desc="${desc:-$default_desc}"
 
@@ -128,7 +128,14 @@ name: ${SKILL_SLUG}
 description: ${desc}
 ---
 
-When a WhatsApp message matches what this skill is for, do not try to handle it yourself. Hand it to the n8n automation instead - it does the real work and reports back.
+When a WhatsApp message matches what this skill is for, you MUST hand it to the n8n automation below. Do this even if you could technically satisfy the request another way.
+
+IMPORTANT - do not take a shortcut. Specifically, do NOT:
+  - write a local file, note, or markdown document with your own file tools
+  - answer from your own memory or search results
+  - use any built-in skill, tool, or capability of your own to produce a similar-looking result
+
+A locally saved file, or an answer typed in chat, is NOT the same thing the user asked for, even if it looks similar. The user wants this handled by n8n specifically - it saves to their actual Google account (a real Google Doc, Sheet, or Calendar entry they can open on their phone), not a file on this server. Only the command below actually does that. If you skip it, the user's request has NOT been completed, no matter what else you produced.
 
 Run this with your shell tool, filling in the sender's phone number and their exact message:
 
@@ -140,7 +147,7 @@ curl -s -X POST ${url} \\
 It returns JSON. Reply on WhatsApp confirming completion in your own words. Do not show the raw JSON or the webhook URL to the user.
 
 Only use this skill when the request matches: ${desc}
-For everything else, respond normally without using this skill.
+For everything else, respond normally without using this skill or any of the tools mentioned above.
 SKILLEOF
 
 chown -R 1000:1000 "$skill_dir" 2>/dev/null || true
