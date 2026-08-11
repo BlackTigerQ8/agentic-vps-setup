@@ -112,6 +112,9 @@ echo ""
 echo "  Voice notes are transcribed to text before OpenClaw reads them. Seeing"
 echo "  that transcript in the chat helps trainees understand what happened -"
 echo "  useful for a bootcamp, easy to turn off later if it gets noisy."
+echo "  ${DIM}(If you turn this on, the echoed transcript will show a"
+echo "  '[VOICE_NOTE_INPUT]' tag at the start - that's an internal marker"
+echo "  this setup relies on, harmless, just a bit ugly.)${RESET}"
 read -rp "  ${CYAN}?${RESET} Show the transcript in chat too? [Y/n]: " echo_ans || true
 echo_transcript=true
 [[ "$echo_ans" =~ ^[Nn] ]] && echo_transcript=false
@@ -242,6 +245,13 @@ cat > "${bin_dir}/elevenlabs-transcribe.sh" <<'WRAPPEREOF'
 # Reads ELEVENLABS_API_KEY from the environment (already set on this
 # container via stack.env). Prints the transcript to stdout, or nothing
 # if the call fails - never a fake error dressed up as a transcript.
+#
+# The [VOICE_NOTE_INPUT] prefix is deliberate: OpenClaw builds the model's
+# message body directly from this output, with no other indication that a
+# message originated as audio (confirmed against raw gateway logs - the
+# audio/ogg mediaType never reaches the model, only this transcript text
+# does). Without a marker here, no skill can ever detect "this was a voice
+# note" - there is nothing else to check.
 AUDIO_FILE="$1"
 curl -sS --max-time 30 -X POST https://api.elevenlabs.io/v1/speech-to-text \
     -H "xi-api-key: ${ELEVENLABS_API_KEY}" \
@@ -251,7 +261,10 @@ curl -sS --max-time 30 -X POST https://api.elevenlabs.io/v1/speech-to-text \
 let d = "";
 process.stdin.on("data", c => { d += c; });
 process.stdin.on("end", () => {
-    try { process.stdout.write((JSON.parse(d).text || "").trim()); }
+    try {
+        const t = (JSON.parse(d).text || "").trim();
+        process.stdout.write(t ? "[VOICE_NOTE_INPUT] " + t : "");
+    }
     catch (e) { process.stdout.write(""); }
 });
 '
@@ -284,25 +297,31 @@ fi
 # The bundled sag skill only fires when a message explicitly asks for voice
 # ("explain in voice", "crazy scientist voice") - confirmed by server logs
 # showing zero sag invocations even for direct requests like "reply in voice,
-# don't write text". Writing our own skill with an unconditional instruction,
-# the same approach that made n8n-automation fire reliably.
+# don't write text". A rewritten skill with unconditional wording (v1 of this
+# fix) STILL never fired - confirmed via raw gateway logs that the model's
+# message body has no signal distinguishing a voice note from typed text, so
+# "check if this arrived as a voice note" was asking the model to check
+# something it cannot see. The transcription wrapper now prepends a literal
+# [VOICE_NOTE_INPUT] marker to its own output for exactly this reason - this
+# skill checks for that marker instead of an unobservable fact.
 step "Writing the voice-note auto-reply skill ..."
 voice_skill_dir="${DEPLOY_DIR}/openclaw-workspace/voice-note-auto-reply"
 mkdir -p "$voice_skill_dir"
 cat > "${voice_skill_dir}/SKILL.md" <<'SKILLEOF'
 ---
 name: voice-note-auto-reply
-description: Whenever the message you are replying to arrived as a voice note (audio), you MUST reply with both text and a spoken voice note. Not optional, not judgment-based - a voice note in always means a voice note out.
+description: Whenever the user's message starts with the literal marker [VOICE_NOTE_INPUT], you MUST reply with both text and a spoken voice note. Not optional, not judgment-based - that marker always means a voice note out.
 ---
 
-Check every incoming message: did it arrive as a voice note (audio), or as typed text?
+Look at the raw text of the message you are replying to. Does it start with the literal marker [VOICE_NOTE_INPUT]?
 
-If it was a voice note, you MUST do both of the following, every time, with no exceptions:
+If yes, you MUST do all of the following, every time, with no exceptions:
 
-1. Reply normally in text, exactly as you would otherwise.
-2. ALSO generate a spoken version of that same reply using the sag command, and include it in the same response.
+1. Treat the rest of the text after the marker as the user's actual message - respond to that content normally.
+2. Reply normally in text, exactly as you would otherwise. Never show the [VOICE_NOTE_INPUT] marker itself to the user - strip it, it is an internal signal only.
+3. ALSO generate a spoken version of that same reply using the sag command, and include it in the same response.
 
-To generate the voice version, run this with your shell tool (write the reply text to the file first if it contains quotes or special characters):
+To generate the voice version, run this with your shell tool (write the reply text to a file first if it contains quotes or special characters):
 
 sag -v Clawd -o /tmp/voice-reply.mp3 "The text of your reply here"
 
@@ -310,9 +329,9 @@ Then include this exact line in your reply, on its own line, so the audio is act
 
 MEDIA:/tmp/voice-reply.mp3
 
-Do this every single time the incoming message was a voice note, even if the message itself does not ask for a voice reply. Sending text only when the user sent you a voice note is incomplete and wrong - it must be text AND voice together.
+Do this every single time the message starts with [VOICE_NOTE_INPUT], even if the message itself does not ask for a voice reply. Sending text only when this marker is present is incomplete and wrong - it must be text AND voice together.
 
-If the incoming message was plain typed text (not a voice note), do not use this skill - reply normally in text only, no audio.
+If the message does NOT start with [VOICE_NOTE_INPUT], do not use this skill - reply normally in text only, no audio.
 SKILLEOF
 chown -R 1000:1000 "$voice_skill_dir" 2>/dev/null || true
 
