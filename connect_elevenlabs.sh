@@ -297,29 +297,38 @@ fi
 # The bundled sag skill only fires when a message explicitly asks for voice
 # ("explain in voice", "crazy scientist voice") - confirmed by server logs
 # showing zero sag invocations even for direct requests like "reply in voice,
-# don't write text". A rewritten skill with unconditional wording (v1 of this
-# fix) STILL never fired - confirmed via raw gateway logs that the model's
-# message body has no signal distinguishing a voice note from typed text, so
-# "check if this arrived as a voice note" was asking the model to check
-# something it cannot see. The transcription wrapper now prepends a literal
-# [VOICE_NOTE_INPUT] marker to its own output for exactly this reason - this
-# skill checks for that marker instead of an unobservable fact.
+# don't write text". A rewritten skill checking for a [VOICE_NOTE_INPUT] text
+# marker (v2 of this fix) ALSO never fired - confirmed via raw log grep that
+# the marker never reaches the model at all, because the transcription
+# wrapper that would inject it never runs: gemini-2.5-flash is natively
+# multimodal, and OpenClaw hands it the raw audio file directly, bypassing
+# audio.transcription.command entirely (confirmed: the wrapper's own
+# filename appears zero times anywhere in the gateway logs). v2's premise
+# was false, not just its wording.
+#
+# v3: since the model perceives audio as a distinct input modality, it has
+# its own native awareness of whether a given turn included one - it does
+# not need an external marker for that, only instructions on what to do
+# about it. This is genuinely unverified: if it still does not fire, the
+# problem is architectural (forcing text-only transcription to make v2's
+# marker approach viable), not something another skill rewrite can fix.
 step "Writing the voice-note auto-reply skill ..."
 voice_skill_dir="${DEPLOY_DIR}/openclaw-workspace/voice-note-auto-reply"
 mkdir -p "$voice_skill_dir"
 cat > "${voice_skill_dir}/SKILL.md" <<'SKILLEOF'
 ---
 name: voice-note-auto-reply
-description: Whenever the user's message starts with the literal marker [VOICE_NOTE_INPUT], you MUST reply with both text and a spoken voice note. Not optional, not judgment-based - that marker always means a voice note out.
+description: Whenever the CURRENT message you are responding to included an audio/voice file that you yourself listened to and understood (not typed text), you MUST reply with both text and a spoken voice note. Not optional, not judgment-based.
 ---
 
-Look at the raw text of the message you are replying to. Does it start with the literal marker [VOICE_NOTE_INPUT]?
+For the message you are replying to right now: did it include an actual audio or voice recording that you directly listened to and understood, as opposed to plain typed text?
 
-If yes, you MUST do all of the following, every time, with no exceptions:
+You will know the answer yourself, directly - you perceive audio content as part of your own multimodal understanding of the conversation, not from anything written in the message text. If you heard a voice clip this turn and used it to understand the user's request, the answer is yes. If you only received typed text, the answer is no.
 
-1. Treat the rest of the text after the marker as the user's actual message - respond to that content normally.
-2. Reply normally in text, exactly as you would otherwise. Never show the [VOICE_NOTE_INPUT] marker itself to the user - strip it, it is an internal signal only.
-3. ALSO generate a spoken version of that same reply using the sag command, and include it in the same response.
+If the answer is yes, you MUST do both of the following, every time, with no exceptions:
+
+1. Reply normally in text, exactly as you would otherwise.
+2. ALSO generate a spoken version of that same reply using the sag command, and include it in the same response.
 
 To generate the voice version, run this with your shell tool (write the reply text to a file first if it contains quotes or special characters):
 
@@ -329,9 +338,9 @@ Then include this exact line in your reply, on its own line, so the audio is act
 
 MEDIA:/tmp/voice-reply.mp3
 
-Do this every single time the message starts with [VOICE_NOTE_INPUT], even if the message itself does not ask for a voice reply. Sending text only when this marker is present is incomplete and wrong - it must be text AND voice together.
+Do this every single time the current message involved audio you listened to, even if the user did not explicitly ask for a voice reply. Sending text only after listening to a voice note is incomplete and wrong - it must be text AND voice together.
 
-If the message does NOT start with [VOICE_NOTE_INPUT], do not use this skill - reply normally in text only, no audio.
+If the current message was plain typed text with no audio involved, do not use this skill - reply normally in text only, no audio.
 SKILLEOF
 chown -R 1000:1000 "$voice_skill_dir" 2>/dev/null || true
 
