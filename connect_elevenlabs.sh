@@ -226,12 +226,102 @@ if [ "$echo_transcript" = true ]; then
         || warn "Could not enable transcript echo - continuing anyway"
 fi
 
+# tools.media.audio.enabled only turns on the PERMISSION to understand audio.
+# It does not say HOW - that is a separate, required field (audio.transcription
+# .command) that was missing entirely before this fix, so transcription never
+# actually worked for anyone. Point it at a small wrapper that calls
+# ElevenLabs' own speech-to-text, reusing the key already saved above - no
+# Whisper, no second subscription, works the same on free or paid ElevenLabs.
+step "Wiring up voice-note transcription (ElevenLabs, not Whisper) ..."
+bin_dir="${DEPLOY_DIR}/openclaw-workspace/bin"
+mkdir -p "$bin_dir"
+cat > "${bin_dir}/elevenlabs-transcribe.sh" <<'WRAPPEREOF'
+#!/bin/sh
+# Transcribes one audio file via ElevenLabs speech-to-text.
+# Usage: elevenlabs-transcribe.sh /path/to/audio-file
+# Reads ELEVENLABS_API_KEY from the environment (already set on this
+# container via stack.env). Prints the transcript to stdout, or nothing
+# if the call fails - never a fake error dressed up as a transcript.
+AUDIO_FILE="$1"
+curl -sS --max-time 30 -X POST https://api.elevenlabs.io/v1/speech-to-text \
+    -H "xi-api-key: ${ELEVENLABS_API_KEY}" \
+    -F "file=@${AUDIO_FILE}" \
+    -F "model_id=scribe_v2" \
+| node -e '
+let d = "";
+process.stdin.on("data", c => { d += c; });
+process.stdin.on("end", () => {
+    try { process.stdout.write((JSON.parse(d).text || "").trim()); }
+    catch (e) { process.stdout.write(""); }
+});
+'
+WRAPPEREOF
+chmod +x "${bin_dir}/elevenlabs-transcribe.sh"
+chown -R 1000:1000 "$bin_dir" 2>/dev/null || true
+ok "Wrapper script written"
+
+if oc_q config set audio.transcription.command \
+        '["/home/node/.openclaw/workspace/bin/elevenlabs-transcribe.sh", "{{MediaPath}}"]' \
+        --strict-json >/tmp/connect_11labs_last.log 2>&1; then
+    ok "Transcription command set"
+else
+    bad "Could not set the transcription command"
+    tail -n 20 /tmp/connect_11labs_last.log
+    die "Voice notes in will not work until this is fixed - everything else above is still saved."
+fi
+oc_q config set audio.transcription.timeoutSeconds 30 >/tmp/connect_11labs_last.log 2>&1 \
+    && ok "Transcription timeout set" \
+    || warn "Could not set transcription timeout - continuing anyway"
+
 if oc_q config set skills.entries.sag.enabled true >/tmp/connect_11labs_last.log 2>&1; then
     ok "sag skill enabled"
 else
     bad "Could not enable the sag skill"
     tail -n 20 /tmp/connect_11labs_last.log
     die "Stopped here - the earlier steps (image, keys) are still saved, just this switch didn't flip."
+fi
+
+# The bundled sag skill only fires when a message explicitly asks for voice
+# ("explain in voice", "crazy scientist voice") - confirmed by server logs
+# showing zero sag invocations even for direct requests like "reply in voice,
+# don't write text". Writing our own skill with an unconditional instruction,
+# the same approach that made n8n-automation fire reliably.
+step "Writing the voice-note auto-reply skill ..."
+voice_skill_dir="${DEPLOY_DIR}/openclaw-workspace/voice-note-auto-reply"
+mkdir -p "$voice_skill_dir"
+cat > "${voice_skill_dir}/SKILL.md" <<'SKILLEOF'
+---
+name: voice-note-auto-reply
+description: Whenever the message you are replying to arrived as a voice note (audio), you MUST reply with both text and a spoken voice note. Not optional, not judgment-based - a voice note in always means a voice note out.
+---
+
+Check every incoming message: did it arrive as a voice note (audio), or as typed text?
+
+If it was a voice note, you MUST do both of the following, every time, with no exceptions:
+
+1. Reply normally in text, exactly as you would otherwise.
+2. ALSO generate a spoken version of that same reply using the sag command, and include it in the same response.
+
+To generate the voice version, run this with your shell tool (write the reply text to the file first if it contains quotes or special characters):
+
+sag -v Clawd -o /tmp/voice-reply.mp3 "The text of your reply here"
+
+Then include this exact line in your reply, on its own line, so the audio is actually attached and sent:
+
+MEDIA:/tmp/voice-reply.mp3
+
+Do this every single time the incoming message was a voice note, even if the message itself does not ask for a voice reply. Sending text only when the user sent you a voice note is incomplete and wrong - it must be text AND voice together.
+
+If the incoming message was plain typed text (not a voice note), do not use this skill - reply normally in text only, no audio.
+SKILLEOF
+chown -R 1000:1000 "$voice_skill_dir" 2>/dev/null || true
+
+if oc_q skills install /home/node/.openclaw/workspace/voice-note-auto-reply \
+        --as voice-note-auto-reply --force >/tmp/connect_11labs_last.log 2>&1; then
+    ok "voice-note-auto-reply skill installed"
+else
+    bad "Could not install the voice-note-auto-reply skill"
+    tail -n 20 /tmp/connect_11labs_last.log
 fi
 
 step "Checking the config is still valid ..."
@@ -262,16 +352,21 @@ done
 
 step "Checking sag is actually ready ..."
 oc skills info sag
+step "Checking voice-note-auto-reply is actually ready ..."
+oc skills info voice-note-auto-reply
 
 # =============================================================================
 sect "Done"
 
 echo "  ${GREEN}${BOLD}Voice is connected.${RESET}"
 echo ""
-echo "  If the check above shows the sag binary with a checkmark, try it on"
-echo "  WhatsApp now:"
-echo "    - Send OpenClaw a normal voice note and see if it understands it"
-echo "    - Ask it to reply in voice and see if a voice note comes back"
+echo "  Voice notes in are transcribed by ElevenLabs now, not Whisper - no"
+echo "  second subscription needed, works the same on a free ElevenLabs plan."
+echo ""
+echo "  If both checks above show a checkmark, try it on WhatsApp now:"
+echo "    - Send OpenClaw any voice note - a plain question is enough, no need"
+echo "      to ask for voice back. It should reply with text AND a voice note."
+echo "    - A typed text message should still get a text-only reply."
 echo ""
 echo "  ${YELLOW}${BOLD}One thing to know:${RESET} 'sudo agentic update' will fail to pull"
 echo "  openclaw-gateway from now on, because it points at a local image, not"
