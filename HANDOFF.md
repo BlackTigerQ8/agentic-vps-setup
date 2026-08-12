@@ -37,7 +37,7 @@ Two services, one VPS:
 | `diagnose.sh` | Read-only health check, changes nothing | Stable |
 | `reset.sh` | Tears down the stack for a clean re-run (keeps SSL cert + images by default to avoid Let's Encrypt rate limits) | Stable |
 | `connect_n8n.sh` | Wires a WhatsApp message to an n8n workflow via an OpenClaw **skill** (agent-judgment based, not a hard trigger) | Stable, working |
-| `connect_elevenlabs.sh` | Adds ElevenLabs voice replies + voice-note understanding to OpenClaw | **Actively broken, see §5 — this is the live investigation** |
+| `connect_elevenlabs.sh` | Adds ElevenLabs voice replies + voice-note understanding to OpenClaw | Stable, working (v3.0.0) — see §5 |
 | `fix_openclaw.sh` | Deprecated shim, redirects users to `agentic` commands | Legacy, keep for old links |
 
 All `connect_*.sh` scripts share a design pattern, established deliberately after an earlier mistake (see §4): standalone, run via `curl | bash`, idempotent (safe to re-run with new values), never touch `vps_setup.sh` or the `agentic` helper, read `/etc/agentic-stack.conf` + `/opt/agentic-stack/stack.env` directly.
@@ -96,76 +96,88 @@ openclaw config schema | jq -c 'paths(type=="object") as $p | select(getpath($p)
 
 ### 5.4 Config schema — confirmed WRONG assumptions (do not repeat these)
 
-- **`tts.provider` / `tts.auto` / `tts.providers.elevenlabs.*` do not exist as config keys.** Official doc pages (`docs.openclaw.ai/tools/tts`, `/providers/elevenlabs`) show a working-looking JSON5 example using this exact shape. It is wrong for this version. Attempting `config set tts.provider elevenlabs` fails with `Unrecognized key: "tts"`.
-- There is no single "speak every reply" deterministic switch anywhere in the schema.
+- **`tts.provider` / `tts.auto` / `tts.providers.elevenlabs.*` do not exist as config keys.** Official doc pages (`docs.openclaw.ai/tools/tts`, `/providers/elevenlabs`) show a working-looking JSON5 example using this exact shape. It is wrong for this version. Attempting `config set tts.provider elevenlabs` fails with `Unrecognized key: "tts"`. **The real namespace is `messages.tts.*`** — see §5.5. Both facts are simultaneously true because they're different paths; don't let a failed `tts.*` attempt rule out `messages.tts.*`.
+- **There is no way to load custom/local plugin code.** `openclaw config schema | jq '.properties.plugins'` shows `plugins.entries` is a **closed catalog of ~70 pre-bundled plugin IDs** (`elevenlabs`, `whatsapp`, `google`, `codex`, `talk-voice`, `tts-local-cli`, etc.), each with a fixed `enabled` / `hooks` (policy toggles) / `subagent` / `llm` / `config` shape, `additionalProperties: false` throughout — no `source`, `path`, or any field for pointing at your own plugin file. `plugins.load.paths` also does not exist (`plugins` itself is `additionalProperties: false`). A typed-hooks Plugin SDK (`before_prompt_build`, `before_model_resolve`, etc.) is real and documented, but with no supported plugin-loading mechanism for non-bundled code, it's unusable for anything you'd write yourself on this deployed version. Don't attempt to write a custom plugin again without first re-confirming this hasn't changed in a newer OpenClaw release.
+- **`messages.tts.providers.<id>.apiKey` as a secret-reference object requires a *registered* secret provider — using one that isn't registered doesn't just fail to apply, it crash-loops the gateway.** The schema accepts `apiKey: string | {"source":"env"|"file"|"exec","provider":"<id>","id":"<VAR>"}`. It's tempting to write `{"source":"env","provider":"elevenlabs","id":"ELEVENLABS_API_KEY"}`, but `provider` here means "a registered secret provider named elevenlabs," which doesn't exist by default — not "the elevenlabs plugin." Setting this causes every gateway restart to fail immediately with `SecretProviderResolutionError: Secret provider "elevenlabs" is not configured`, and after a few failed restarts a crash-loop breaker trips and suppresses channel auto-start even once the config is fixed (see §5.8 for full recovery). **Use a plain string for `apiKey` instead** — it's valid per the schema and is what actually works.
 
-### 5.5 The real mechanism for ElevenLabs voice replies: the `sag` skill
+### 5.5 RESOLVED: automatic voice replies use `messages.tts`, a native gateway mechanism — not a skill
 
-`sag` is a **bundled, disabled-by-default skill** (not a config feature). Its own `SKILL.md` (read directly from `/app/skills/sag/SKILL.md` inside the container) is the authoritative source:
+Confirmed working end-to-end (verified by both a live test on this project's own server and an independent reference build). This supersedes every skill-based attempt described below (§5.7 has the condensed history, kept only so nobody retries it).
 
+`messages.tts.auto` is a **gateway-level switch, judged by the gateway itself from the real inbound message type — not something the model decides or has to notice.** Values: `off` | `always` | `inbound` | `tagged`. `inbound` = voice-in triggers voice-out; typed messages still get typed replies.
+
+**The full set of fields that must ALL be set together, or TTS silently does nothing:**
+
+```bash
+openclaw config set messages.tts.enabled true
+openclaw config set messages.tts.auto inbound
+openclaw config set messages.tts.provider elevenlabs
+openclaw config set messages.tts.providers.elevenlabs.apiKey "<plain-string-key>"
+openclaw config set messages.tts.providers.elevenlabs.model eleven_multilingual_v2
+openclaw config set messages.tts.providers.elevenlabs.speakerVoiceId "<voice-id>"
 ```
-sag -v Clawd -o /tmp/voice-reply.mp3 "text"
-# then include this exact line in the reply:
-MEDIA:/tmp/voice-reply.mp3
-```
 
-Voice selection env vars: `ELEVENLABS_VOICE_ID` or `SAG_VOICE_ID`. Default voice is `Clawd` (`lj2rcrvANS3gaWWnczSX`) per the skill's own instructions.
+**The critical, easy-to-miss gotcha:** a provider with only `apiKey` set (no `speakerVoiceId`, no `model`) reports `"configured": true` in `capability tts status` and passes `config validate` — but produces **zero observable effect**. Not an error, not a fallback, not a log line of any kind — the turn just falls straight through to a normal text reply as if TTS were never configured at all. This is exactly what made the bug hard to find: every other diagnostic (`config get`, `config validate`, `capability tts status`) looked correct. The field name is **`speakerVoiceId`**, not `voiceId` or `voice`.
 
-**`sag` requires a real Linux binary that is not in the stock OpenClaw image.** Its own install hint (`Install sag (brew)`) is macOS-only. Real Linux install: prebuilt binaries at `https://github.com/steipete/sag/releases/download/v0.4.1/sag_0.4.1_linux_amd64.tar.gz`, requires the `libasound2` (ALSA) runtime library. Both are baked into a custom Docker image built by `connect_elevenlabs.sh` (see `Dockerfile.openclaw` it generates) — **anything installed via `docker exec` into a running container does not survive a restart**, which is why a real image rebuild was necessary, not a one-off `apt-get install`.
+**`ffmpeg` must be baked into the image.** The stock OpenClaw image doesn't have it. ElevenLabs returns MP3; WhatsApp voice notes need OGG/Opus. OpenClaw transcodes with `ffmpeg` on the way out — without it, synthesis can succeed but no playable voice note ever arrives. `connect_elevenlabs.sh` bakes this into a custom `Dockerfile.openclaw`, the same pattern used for the now-abandoned `sag` binary below (custom image, because anything installed via `docker exec` into a running container doesn't survive a restart).
 
 Known side effect: once `docker-compose.yml` points at a locally-built image tag instead of `ghcr.io/openclaw/openclaw`, `agentic update`'s pull step has nothing to pull from. Documented in the script's own output; the fix is re-running `connect_elevenlabs.sh`, which always rebuilds from the real upstream tag (tracked in a marker file `.openclaw-base-image` written on first run, specifically so re-runs don't try to build the image FROM itself).
 
-### 5.6 The bundled `sag` skill's own trigger is too weak — confirmed via live logs
+### 5.6 Verification commands that actually confirm TTS works — use these, not log-grepping
+
+These were the single biggest process improvement from finally solving this: they tell you the real state in one call, discovered from a reference build's own troubleshooting notes.
+
+```bash
+# Enabled? auto mode? provider? is each provider's config actually present?
+openclaw capability tts status
+
+# Real synthesis test — look for the target provider showing success, not a fallback
+openclaw capability tts convert --text "voice note test" --channel whatsapp --output /tmp/t --json
+
+# List real voice IDs available on the account (don't guess one)
+openclaw capability tts voices --provider elevenlabs
+
+# ffmpeg present in the running container
+docker exec openclaw-gateway which ffmpeg
+```
+
+### 5.7 Dead-end history — kept only so these aren't retried
+
+Three sequential skill-based approaches were tried before the native mechanism (§5.5) was found, all confirmed failed via real evidence, not assumption.
+
+**The bundled `sag` skill's own trigger is too weak — confirmed via live logs**
 
 `sag`'s own `SKILL.md` only instructs the model to use it "when the user asks for a voice reply." **Confirmed via raw gateway log inspection that this never fires**, even for maximally explicit requests in the same conversation ("reply in voice, don't write text" — Arabic: `"رد طي بصوت، لا تكتب"`). Across four separate test messages, `sag` never once appeared in the logs.
 
 Fix attempted: a second, custom skill (`voice-note-auto-reply`, installed via `openclaw skills install <path> --as <name> --force`, same pattern as `n8n-automation`) with unconditional, forceful wording ("you MUST", "not optional"). **This also did not fire.**
 
-### 5.7 Root cause found: the model has no signal that a message was a voice note
+**Why it failed twice more:** the raw JSON log file at `/tmp/openclaw/openclaw-<date>.log` inside the container (NOT `docker logs`, which is a filtered subset) showed the model's `body` field is indistinguishable from typed text — `mediaType`/`mediaPath` exist only in OpenClaw's own internal log entry, never reaching the model. A second attempt tried injecting a `[VOICE_NOTE_INPUT]` marker via the STT transcription wrapper so a skill could check for it textually — also never fired, because `audio.transcription.command` turned out to never execute at all for this natively multimodal model (`gemini-2.5-flash` receives the raw audio file directly; confirmed by the wrapper's own filename appearing zero times in the raw logs). A third attempt asked the model to introspect on its own audio perception directly, no marker needed — also never fired.
 
-Direct proof, from the raw JSON log file at `/tmp/openclaw/openclaw-<date>.log` inside the container (NOT `docker logs`, which is a filtered subset):
+**Root cause for all three, in hindsight:** OpenClaw's skill routing is relevance/topic-judged by the model. A trigger condition that's a structural fact about the *current turn's modality* — not a topic — is not the kind of thing skill routing reliably surfaces, regardless of wording. This is why the fix that actually worked lives at the gateway level (§5.5), not in a skill.
 
-```json
-"body":"[WhatsApp +9665... GMT+3] +9665...: <transcribed text>","mediaType":"audio/ogg; codecs=opus","mediaPath":"..."
-```
+A parallel investigation into using OpenClaw's typed-hooks Plugin SDK (`before_prompt_build` et al.) to inject a deterministic signal was abandoned once §5.4 established there's no supported way to load custom plugin code on this OpenClaw version at all.
 
-**The `body` field — exactly what the model receives — is indistinguishable from a typed text message.** `mediaType`/`mediaPath` exist only in OpenClaw's own internal log entry, never reaching the model. No amount of skill wording can make the model detect something it structurally cannot see.
+### 5.8 Recovering from a bad `openclaw.json` / gateway crash-loop
 
-### 5.8 Fix attempted: inject a detectable marker via the transcription wrapper
+This happened for real during this project — an invalid `apiKey` secret-reference (§5.4) put the gateway into a full crash-loop and took WhatsApp offline. The recovery procedure, in order:
 
-Since `audio.transcription.command`'s own output becomes the `body` text verbatim, the wrapper script (`elevenlabs-transcribe.sh`, generated by `connect_elevenlabs.sh` into the persistent `openclaw-workspace/bin/` volume) was changed to prepend a literal marker:
+1. **`docker compose stop openclaw-gateway`** — holds it down cleanly. A normal `unless-stopped`-style restart policy respects an explicit stop.
+   - **Do NOT try to fix it via `docker compose run --rm openclaw-cli config set ...` while the gateway container is mid-restart-loop.** That command depends on attaching to the gateway container's network namespace and will fail silently with `cannot join network namespace of container: ... is restarting` — the fix never actually applies, and it's easy to not notice this and think the fix didn't work.
+2. Find the host-mounted config file: `docker inspect openclaw-gateway --format '{{json .Mounts}}' | jq -r '.[] | "\(.Source) -> \(.Destination)"'` → `openclaw.json` lives on the host at `<DEPLOY_DIR>/openclaw/openclaw.json`, mounted to `/home/node/.openclaw` in the container.
+3. Edit it directly on the host with `jq`. Back it up first, and preserve the original owner (`stat -c '%u:%g' "$CONF"` before editing, `chown` back after) so the container (running as non-root `node`) can still read it:
+   ```bash
+   CONF=/opt/agentic-stack/openclaw/openclaw.json
+   cp "$CONF" "${CONF}.bak-$(date +%s)"
+   OWNER=$(stat -c '%u:%g' "$CONF")
+   jq '.messages.tts.providers.elevenlabs.apiKey = "<plain-key>"' "$CONF" > "${CONF}.tmp" && mv "${CONF}.tmp" "$CONF"
+   chown "$OWNER" "$CONF"
+   ```
+4. `docker compose up -d openclaw-gateway`.
+5. **Even after the config is fixed, a restart-loop breaker may still suppress channel auto-start for a boot or two** — log line: `restart-loop breaker tripped: N unclean boot(s) within 300000ms; suppressing channel/provider account auto-start`, followed by `[whatsapp] channel autostart suppressed by crash-loop breaker`. This is a 5-minute rolling window counted from the last crash. There is **no CLI command to force it immediately** — `openclaw channels start <name>` does not exist (the log's own suggestion, "Use channels.start to override," refers to an internal RPC method, not a CLI subcommand; `openclaw channels --help` confirms the real subcommands are `add, capabilities, list, login, logout, logs, remove, resolve, status`). Once genuinely 5 minutes have passed since the last bad boot, one more `docker compose restart openclaw-gateway` clears it — log line: `restart-loop breaker recovered; channel auto-start restored`.
 
-```
-[VOICE_NOTE_INPUT] <transcript text>
-```
+### 5.8b This sandbox cannot SSH into the VPS
 
-The `voice-note-auto-reply` skill was rewritten to check for this literal string instead of the unobservable "did this arrive as audio" fact.
-
-**Verified in isolation**: piping a realistic ElevenLabs API response through the wrapper's actual `node -e` logic correctly produces `[VOICE_NOTE_INPUT] <text>`, UTF-8/Arabic intact.
-
-**Verified on the real server: this marker STILL never appears in `body`, in any log entry, ever** (`grep -c "VOICE_NOTE_INPUT" ... ` returns `0`, and `grep -c "elevenlabs-transcribe"` — the wrapper's own filename — has not yet been checked, see §5.9). Meanwhile `config get audio.transcription.command` confirms the config correctly points at the wrapper.
-
-### 5.9 CONFIRMED: `audio.transcription.command` never executes for this model
-
-Both diagnostics came back conclusively:
-```bash
-sudo docker exec openclaw-gateway grep -c "elevenlabs-transcribe" /tmp/openclaw/openclaw-<date>.log
-# -> 0, in every log file checked
-sudo cat /opt/agentic-stack/openclaw-workspace/bin/elevenlabs-transcribe.sh
-# -> file on disk is correct, not corrupted, matches what the script wrote
-```
-
-**Confirmed, not hypothesized: `gemini-2.5-flash` receives the raw audio file directly (native multimodal input) and OpenClaw never invokes `audio.transcription.command` in this pipeline.** That config path is very likely a fallback for non-multimodal models only. This means the §5.8 marker approach could never have worked — not a wording problem, not a marker-format problem, the wrapper that would inject the marker is simply never called.
-
-### 5.9b Fix attempt #3: trust the model's own native audio awareness
-
-If the model perceives audio as a distinct input modality (which native multimodal handling implies), it should inherently know whether a given turn included one — it doesn't need external help detecting that, only instructions on what to do about it. The `voice-note-auto-reply` skill was rewritten a third time around this premise: instead of checking for a marker or an abstract "did this arrive as audio" fact, it now asks the model to introspect on its own perception — *"did you yourself listen to and understand an audio file this turn?"*
-
-**As of this document, this fix has been written and deployed but not yet confirmed working on a real test.** This is a genuinely different premise from attempts #1 (unobservable fact) and #2 (marker that never reaches the model) — it may still fail, but for a different reason if it does.
-
-**If this also fails**, the conclusion is: no skill-based approach can work while native multimodal audio handling is active, because there is no reliable hook for a skill to condition on. The only remaining paths would be either (a) finding a way to force text-only transcription so the §5.8 marker approach becomes viable (unconfirmed whether such a toggle exists — would need schema investigation for something like a per-model or per-tool capability restriction), or (b) accepting that "voice note in, auto voice+text reply out" cannot be made deterministic on this platform as currently understood, and falling back to the bundled `sag` skill's judgment-based behavior (works for explicit requests like "reply in voice" typed as text, just not automatically for every voice note).
-
-**Do not attempt a fourth skill-wording rewrite without new evidence.** Three different premises have now been tried. If #3 fails, the next step must be a new diagnostic (e.g., checking whether the model's own tool-call trace, via `openclaw audit`, shows anything indicating audio-modality awareness) — not another rephrasing.
+Confirmed by direct test (TCP connection to the VPS's port 22 times out — not an auth failure, no outbound route). Every fix in this project has to be applied via commands the user copy-pastes and runs themselves, then pastes the output back — there is no way for an AI assistant working from a typical sandboxed dev environment to log into the server directly, even given credentials.
 
 ### 5.10 Other confirmed OpenClaw facts, useful for future work
 
@@ -211,6 +223,11 @@ sudo docker exec openclaw-gateway grep -i "<term>" /tmp/openclaw/openclaw-$(date
 # Sessions
 sudo docker exec openclaw-gateway openclaw sessions list
 
+# TTS — real state, not just config values (§5.6)
+sudo docker exec openclaw-gateway openclaw capability tts status
+sudo docker exec openclaw-gateway openclaw capability tts convert --text "test" --channel whatsapp --output /tmp/t --json
+sudo docker exec openclaw-gateway openclaw capability tts voices --provider elevenlabs
+
 # Restart after config changes (required, not optional)
 sudo docker compose -f /opt/agentic-stack/docker-compose.yml restart openclaw-gateway
 ```
@@ -224,3 +241,7 @@ sudo docker compose -f /opt/agentic-stack/docker-compose.yml restart openclaw-ga
 - Do not write skill wording to detect something the model cannot observe — check what the model actually receives (via raw logs) before assuming a wording problem (§5.7)
 - Do not hand-edit `docker-compose.yml`'s image without a marker file tracking the real upstream tag, or re-runs will build FROM the local tag and break (§5.5)
 - Do not use `docker exec` to install anything meant to be permanent — it will not survive a container restart; either bake it into a custom image or place it in a host-mounted volume like `openclaw-workspace/`
+- Do not set `messages.tts.provider` without also setting that provider's `model` and `speakerVoiceId` — it will report as configured and pass validation while silently never synthesizing anything (§5.5)
+- Do not use a `{"source":"env",...}` secret-reference object for `apiKey` unless a matching secret provider is actually registered — it crash-loops the gateway on every restart instead of just failing to apply (§5.4, §5.8)
+- Do not try to fix config via `docker compose run openclaw-cli config set ...` while the gateway container is restarting/crash-looping — it fails silently because it can't attach to the gateway's network namespace; stop the container and edit the host-mounted JSON file directly instead (§5.8)
+- Do not offer to SSH into the user's VPS directly — this sandbox has no outbound network route to it (§5.8b)
