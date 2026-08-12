@@ -3,16 +3,19 @@
 #   CODED Agentic AI Bootcamp - Connect ElevenLabs voice to OpenClaw
 #
 #   Turns on two things:
-#     1. Voice replies - OpenClaw can speak a reply as a WhatsApp voice note
-#        using the bundled "sag" skill (ElevenLabs TTS).
+#     1. Voice replies - OpenClaw automatically replies with a spoken WhatsApp
+#        voice note whenever the message it's replying to was ITSELF a voice
+#        note (typed messages still get typed replies). This uses OpenClaw's
+#        own built-in messages.tts mechanism with ElevenLabs as the speech
+#        provider - not a skill, not a hand-rolled binary. The gateway itself
+#        knows whether the inbound message was audio, so this doesn't depend
+#        on the model noticing or deciding anything.
 #     2. Voice notes in - lets OpenClaw understand a voice note you send it,
-#        using its own built-in audio understanding (no ElevenLabs needed for
-#        this half - it already exists, this just switches it on).
+#        transcribing it via ElevenLabs speech-to-text.
 #
-#   The "sag" skill needs a real binary + the ALSA audio library, neither of
-#   which are in the stock OpenClaw image. This script builds a small custom
-#   image with both baked in and points docker-compose.yml at it. That is the
-#   slow part (a couple of minutes); everything else is quick.
+#   WhatsApp voice notes are OGG/Opus, so this also bakes ffmpeg into a small
+#   custom image (the stock OpenClaw image doesn't have it) - required to
+#   transcode ElevenLabs' MP3 output into a real, playable voice note.
 #
 #   Run this on a server already built by vps_setup.sh - it does not touch
 #   vps_setup.sh, connect_n8n.sh, or anything else. Safe to run again if you
@@ -20,16 +23,17 @@
 #
 #     curl -fsSL https://raw.githubusercontent.com/BlackTigerQ8/agentic-vps-setup/main/connect_elevenlabs.sh -o connect_elevenlabs.sh && sudo bash connect_elevenlabs.sh
 #
-#   Version: 2.0.0
+#   Version: 3.0.0
 # =============================================================================
 
 set -Eeuo pipefail
 
 DEPLOY_DIR="/opt/agentic-stack"
 CONF_FILE="/etc/agentic-stack.conf"
-LOCAL_IMAGE_TAG="agentic-openclaw-sag:latest"
-SAG_VERSION="0.4.1"
-SAG_URL="https://github.com/steipete/sag/releases/download/v${SAG_VERSION}/sag_${SAG_VERSION}_linux_amd64.tar.gz"
+LOCAL_IMAGE_TAG="agentic-openclaw-voice:latest"
+OLD_LOCAL_IMAGE_TAG="agentic-openclaw-sag:latest"
+DEFAULT_VOICE_ID="21m00Tcm4TlvDq8ikWAm"   # ElevenLabs premade voice "Rachel" - a safe default that exists on every account
+TTS_MODEL="eleven_multilingual_v2"        # handles Arabic + English
 
 if [ -t 1 ]; then
     RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'
@@ -85,12 +89,14 @@ oc_q() { dc run --rm -T openclaw-cli "$@"; }
 sect "What this does"
 
 echo "  Right now OpenClaw replies on WhatsApp with text. This adds a real voice:"
-echo "  when someone sends a voice note, OpenClaw can understand it, and it can"
-echo "  reply back with a spoken voice note using ElevenLabs."
+echo "  when someone sends a voice note, OpenClaw understands it, and it will"
+echo "  automatically reply with a spoken voice note back - only when the"
+echo "  incoming message was itself a voice note. A typed message still gets"
+echo "  a typed reply."
 echo ""
 echo "  Have your ${BOLD}ElevenLabs API key${RESET} ready - from elevenlabs.io -> Profile ->"
-echo "  API Keys. A voice ID is optional; OpenClaw has its own default character"
-echo "  voice and may use that unless a conversation asks for something else."
+echo "  API Keys. A voice ID is optional; leave it blank to use a standard"
+echo "  ElevenLabs default voice, or paste one from your own ElevenLabs account."
 echo ""
 echo "  ${YELLOW}This step builds a small custom container image, so it takes a few"
 echo "  minutes - longer than the other connect scripts.${RESET}"
@@ -106,15 +112,13 @@ while [ -z "$key" ]; do
 done
 
 voice_id=""
-read -rp "  ${CYAN}?${RESET} Preferred voice ID (optional - press Enter to skip): " voice_id || true
+read -rp "  ${CYAN}?${RESET} Preferred voice ID (optional - press Enter for a default voice): " voice_id || true
+[ -z "$voice_id" ] && voice_id="$DEFAULT_VOICE_ID"
 
 echo ""
 echo "  Voice notes are transcribed to text before OpenClaw reads them. Seeing"
 echo "  that transcript in the chat helps trainees understand what happened -"
 echo "  useful for a bootcamp, easy to turn off later if it gets noisy."
-echo "  ${DIM}(If you turn this on, the echoed transcript will show a"
-echo "  '[VOICE_NOTE_INPUT]' tag at the start - that's an internal marker"
-echo "  this setup relies on, harmless, just a bit ugly.)${RESET}"
 read -rp "  ${CYAN}?${RESET} Show the transcript in chat too? [Y/n]: " echo_ans || true
 echo_transcript=true
 [[ "$echo_ans" =~ ^[Nn] ]] && echo_transcript=false
@@ -122,7 +126,7 @@ echo_transcript=true
 echo ""
 echo "  ${BOLD}Review:${RESET}"
 echo "    API key:         ${DIM}hidden (${#key} characters)${RESET}"
-echo "    Voice ID:        ${CYAN}${voice_id:-<OpenClaw default>}${RESET}"
+echo "    Voice ID:        ${CYAN}${voice_id}${RESET}"
 echo "    Show transcript: ${CYAN}${echo_transcript}${RESET}"
 echo ""
 read -rp "  ${CYAN}?${RESET} Connect this now? [y/N]: " confirm || true
@@ -142,7 +146,7 @@ set_env_var() {
 }
 
 set_env_var ELEVENLABS_API_KEY "$key"
-[ -n "$voice_id" ] && set_env_var ELEVENLABS_VOICE_ID "$voice_id"
+set_env_var ELEVENLABS_VOICE_ID "$voice_id"
 chmod 600 "${DEPLOY_DIR}/stack.env"
 ok "Saved to ${DEPLOY_DIR}/stack.env"
 
@@ -165,12 +169,8 @@ cat > "${DEPLOY_DIR}/Dockerfile.openclaw" <<EOF
 FROM ${BASE_IMAGE}
 USER root
 RUN apt-get update && \\
-    apt-get install -y --no-install-recommends libasound2 ca-certificates curl && \\
+    apt-get install -y --no-install-recommends ffmpeg ca-certificates curl && \\
     rm -rf /var/lib/apt/lists/*
-RUN curl -fsSL ${SAG_URL} -o /tmp/sag.tar.gz && \\
-    tar -xzf /tmp/sag.tar.gz -C /usr/local/bin sag && \\
-    chmod +x /usr/local/bin/sag && \\
-    rm /tmp/sag.tar.gz
 USER node
 EOF
 
@@ -187,7 +187,7 @@ else
 fi
 
 step "Pointing docker-compose.yml at the new image ..."
-sed -i -E "s#image:[[:space:]]*(ghcr\.io/openclaw/openclaw:[^[:space:]]+|${LOCAL_IMAGE_TAG//\//\\/})#image: ${LOCAL_IMAGE_TAG}#" \
+sed -i -E "s#image:[[:space:]]*(ghcr\.io/openclaw/openclaw:[^[:space:]]+|${OLD_LOCAL_IMAGE_TAG//\//\\/}|${LOCAL_IMAGE_TAG//\//\\/})#image: ${LOCAL_IMAGE_TAG}#" \
     "${DEPLOY_DIR}/docker-compose.yml"
 ok "docker-compose.yml updated"
 
@@ -211,11 +211,8 @@ done
 [ "$up" = true ] && ok "OpenClaw is back up" || warn "OpenClaw is slow to come back. Check:  sudo agentic status"
 
 # =============================================================================
-sect "Turning on voice notes in and the sag skill"
+sect "Turning on voice notes in"
 
-# There is no `openclaw skills enable` command - skills are bundled but
-# disabled by default, and turned on the same way everything else is:
-# a config path, confirmed against the live schema (skills.entries.<name>.enabled).
 if oc_q config set tools.media.audio.enabled true >/tmp/connect_11labs_last.log 2>&1; then
     ok "Audio understanding enabled"
 else
@@ -231,10 +228,9 @@ fi
 
 # tools.media.audio.enabled only turns on the PERMISSION to understand audio.
 # It does not say HOW - that is a separate, required field (audio.transcription
-# .command) that was missing entirely before this fix, so transcription never
-# actually worked for anyone. Point it at a small wrapper that calls
-# ElevenLabs' own speech-to-text, reusing the key already saved above - no
-# Whisper, no second subscription, works the same on free or paid ElevenLabs.
+# .command). Point it at a small wrapper that calls ElevenLabs' own
+# speech-to-text, reusing the key already saved above - no Whisper, no second
+# subscription, works the same on free or paid ElevenLabs.
 step "Wiring up voice-note transcription (ElevenLabs, not Whisper) ..."
 bin_dir="${DEPLOY_DIR}/openclaw-workspace/bin"
 mkdir -p "$bin_dir"
@@ -245,13 +241,6 @@ cat > "${bin_dir}/elevenlabs-transcribe.sh" <<'WRAPPEREOF'
 # Reads ELEVENLABS_API_KEY from the environment (already set on this
 # container via stack.env). Prints the transcript to stdout, or nothing
 # if the call fails - never a fake error dressed up as a transcript.
-#
-# The [VOICE_NOTE_INPUT] prefix is deliberate: OpenClaw builds the model's
-# message body directly from this output, with no other indication that a
-# message originated as audio (confirmed against raw gateway logs - the
-# audio/ogg mediaType never reaches the model, only this transcript text
-# does). Without a marker here, no skill can ever detect "this was a voice
-# note" - there is nothing else to check.
 AUDIO_FILE="$1"
 curl -sS --max-time 30 -X POST https://api.elevenlabs.io/v1/speech-to-text \
     -H "xi-api-key: ${ELEVENLABS_API_KEY}" \
@@ -261,10 +250,7 @@ curl -sS --max-time 30 -X POST https://api.elevenlabs.io/v1/speech-to-text \
 let d = "";
 process.stdin.on("data", c => { d += c; });
 process.stdin.on("end", () => {
-    try {
-        const t = (JSON.parse(d).text || "").trim();
-        process.stdout.write(t ? "[VOICE_NOTE_INPUT] " + t : "");
-    }
+    try { process.stdout.write((JSON.parse(d).text || "").trim()); }
     catch (e) { process.stdout.write(""); }
 });
 '
@@ -286,71 +272,43 @@ oc_q config set audio.transcription.timeoutSeconds 30 >/tmp/connect_11labs_last.
     && ok "Transcription timeout set" \
     || warn "Could not set transcription timeout - continuing anyway"
 
-if oc_q config set skills.entries.sag.enabled true >/tmp/connect_11labs_last.log 2>&1; then
-    ok "sag skill enabled"
-else
-    bad "Could not enable the sag skill"
-    tail -n 20 /tmp/connect_11labs_last.log
-    die "Stopped here - the earlier steps (image, keys) are still saved, just this switch didn't flip."
-fi
+# =============================================================================
+sect "Turning on automatic voice replies"
 
-# The bundled sag skill only fires when a message explicitly asks for voice
-# ("explain in voice", "crazy scientist voice") - confirmed by server logs
-# showing zero sag invocations even for direct requests like "reply in voice,
-# don't write text". A rewritten skill checking for a [VOICE_NOTE_INPUT] text
-# marker (v2 of this fix) ALSO never fired - confirmed via raw log grep that
-# the marker never reaches the model at all, because the transcription
-# wrapper that would inject it never runs: gemini-2.5-flash is natively
-# multimodal, and OpenClaw hands it the raw audio file directly, bypassing
-# audio.transcription.command entirely (confirmed: the wrapper's own
-# filename appears zero times anywhere in the gateway logs). v2's premise
-# was false, not just its wording.
-#
-# v3: since the model perceives audio as a distinct input modality, it has
-# its own native awareness of whether a given turn included one - it does
-# not need an external marker for that, only instructions on what to do
-# about it. This is genuinely unverified: if it still does not fire, the
-# problem is architectural (forcing text-only transcription to make v2's
-# marker approach viable), not something another skill rewrite can fix.
-step "Writing the voice-note auto-reply skill ..."
-voice_skill_dir="${DEPLOY_DIR}/openclaw-workspace/voice-note-auto-reply"
-mkdir -p "$voice_skill_dir"
-cat > "${voice_skill_dir}/SKILL.md" <<'SKILLEOF'
----
-name: voice-note-auto-reply
-description: Whenever the CURRENT message you are responding to included an audio/voice file that you yourself listened to and understood (not typed text), you MUST reply with both text and a spoken voice note. Not optional, not judgment-based.
----
+# This is OpenClaw's own built-in text-to-speech auto-reply mechanism, not a
+# skill. The gateway decides whether to speak based on the inbound message's
+# real type - "inbound" mode means voice-in triggers voice-out, independent
+# of anything the model does. All three of enabled/auto/provider AND a real
+# voice (speakerVoiceId) + model must be set together - a provider with only
+# an apiKey and no voice silently never synthesizes anything (no error, no
+# log line, just a plain text reply every time).
+oc_q config set messages.tts.enabled true >/tmp/connect_11labs_last.log 2>&1 \
+    && ok "TTS enabled" \
+    || { bad "Could not enable TTS"; tail -n 20 /tmp/connect_11labs_last.log; die "Aborting."; }
 
-For the message you are replying to right now: did it include an actual audio or voice recording that you directly listened to and understood, as opposed to plain typed text?
+oc_q config set messages.tts.auto inbound >/tmp/connect_11labs_last.log 2>&1 \
+    && ok "Auto-reply mode set to 'inbound' (voice-in -> voice-out only)" \
+    || { bad "Could not set messages.tts.auto"; tail -n 20 /tmp/connect_11labs_last.log; die "Aborting."; }
 
-You will know the answer yourself, directly - you perceive audio content as part of your own multimodal understanding of the conversation, not from anything written in the message text. If you heard a voice clip this turn and used it to understand the user's request, the answer is yes. If you only received typed text, the answer is no.
+oc_q config set messages.tts.provider elevenlabs >/tmp/connect_11labs_last.log 2>&1 \
+    && ok "TTS provider set to elevenlabs" \
+    || { bad "Could not set messages.tts.provider"; tail -n 20 /tmp/connect_11labs_last.log; die "Aborting."; }
 
-If the answer is yes, you MUST do both of the following, every time, with no exceptions:
+# Plain string, not a secret-reference object - a {"source":"env",...} shape
+# here requires a registered secret provider that doesn't exist by that name
+# and makes the gateway crash-loop on every restart. A plain string is valid
+# per the schema and is what actually works.
+oc_q config set messages.tts.providers.elevenlabs.apiKey "$key" >/tmp/connect_11labs_last.log 2>&1 \
+    && ok "ElevenLabs API key set" \
+    || { bad "Could not set the ElevenLabs API key"; tail -n 20 /tmp/connect_11labs_last.log; die "Aborting."; }
 
-1. Reply normally in text, exactly as you would otherwise.
-2. ALSO generate a spoken version of that same reply using the sag command, and include it in the same response.
+oc_q config set messages.tts.providers.elevenlabs.model "$TTS_MODEL" >/tmp/connect_11labs_last.log 2>&1 \
+    && ok "ElevenLabs model set (${TTS_MODEL})" \
+    || { bad "Could not set the ElevenLabs model"; tail -n 20 /tmp/connect_11labs_last.log; die "Aborting."; }
 
-To generate the voice version, run this with your shell tool (write the reply text to a file first if it contains quotes or special characters):
-
-sag -v Clawd -o /tmp/voice-reply.mp3 "The text of your reply here"
-
-Then include this exact line in your reply, on its own line, so the audio is actually attached and sent:
-
-MEDIA:/tmp/voice-reply.mp3
-
-Do this every single time the current message involved audio you listened to, even if the user did not explicitly ask for a voice reply. Sending text only after listening to a voice note is incomplete and wrong - it must be text AND voice together.
-
-If the current message was plain typed text with no audio involved, do not use this skill - reply normally in text only, no audio.
-SKILLEOF
-chown -R 1000:1000 "$voice_skill_dir" 2>/dev/null || true
-
-if oc_q skills install /home/node/.openclaw/workspace/voice-note-auto-reply \
-        --as voice-note-auto-reply --force >/tmp/connect_11labs_last.log 2>&1; then
-    ok "voice-note-auto-reply skill installed"
-else
-    bad "Could not install the voice-note-auto-reply skill"
-    tail -n 20 /tmp/connect_11labs_last.log
-fi
+oc_q config set messages.tts.providers.elevenlabs.speakerVoiceId "$voice_id" >/tmp/connect_11labs_last.log 2>&1 \
+    && ok "ElevenLabs voice set (${voice_id})" \
+    || { bad "Could not set the ElevenLabs voice"; tail -n 20 /tmp/connect_11labs_last.log; die "Aborting."; }
 
 step "Checking the config is still valid ..."
 if oc_q config validate >/tmp/connect_11labs_last.log 2>&1; then
@@ -358,7 +316,7 @@ if oc_q config validate >/tmp/connect_11labs_last.log 2>&1; then
 else
     bad "Config validation failed"
     tail -n 30 /tmp/connect_11labs_last.log
-    die "Something above isn't right - fix it before relying on this."
+    die "Something above isn't right - fix it before restarting, or OpenClaw may fail to start."
 fi
 
 step "Restarting so the config changes actually take effect ..."
@@ -378,23 +336,52 @@ while [ $((SECONDS - t0)) -lt 60 ]; do
 done
 [ "$up" = true ] && ok "OpenClaw is back up" || warn "OpenClaw is slow to come back. Check:  sudo agentic status"
 
-step "Checking sag is actually ready ..."
-oc skills info sag
-step "Checking voice-note-auto-reply is actually ready ..."
-oc skills info voice-note-auto-reply
+# =============================================================================
+sect "Verifying, before you rely on it"
+
+step "Checking ffmpeg is present ..."
+if dc exec -T openclaw-gateway which ffmpeg >/dev/null 2>&1; then
+    ok "ffmpeg found"
+else
+    warn "ffmpeg not found in the running container - voice replies will fail to send. Check the build log above."
+fi
+
+step "Checking TTS is actually wired up ..."
+oc_q capability tts status || warn "Could not read TTS status"
+
+step "Doing a real ElevenLabs synthesis test (not a fallback) ..."
+if dc exec -T openclaw-gateway sh -c \
+        'openclaw capability tts convert --text "voice test" --channel whatsapp --output /tmp/connect_11labs_test --json' \
+        >/tmp/connect_11labs_last.log 2>&1; then
+    if grep -q '"elevenlabs"[^}]*"success"' /tmp/connect_11labs_last.log 2>/dev/null; then
+        ok "ElevenLabs synthesized successfully (not a fallback)"
+    else
+        warn "Conversion ran but didn't clearly show an elevenlabs success - check the output below"
+        tail -n 20 /tmp/connect_11labs_last.log
+    fi
+else
+    warn "tts convert test failed - check the output below (often means the ElevenLabs key has no credits, or the voice ID doesn't exist on this account)"
+    tail -n 20 /tmp/connect_11labs_last.log
+fi
 
 # =============================================================================
 sect "Done"
 
 echo "  ${GREEN}${BOLD}Voice is connected.${RESET}"
 echo ""
-echo "  Voice notes in are transcribed by ElevenLabs now, not Whisper - no"
-echo "  second subscription needed, works the same on a free ElevenLabs plan."
+echo "  Voice notes in are transcribed by ElevenLabs. Voice replies out use"
+echo "  OpenClaw's own automatic text-to-speech - it fires only when the"
+echo "  message being replied to was itself a voice note."
 echo ""
-echo "  If both checks above show a checkmark, try it on WhatsApp now:"
-echo "    - Send OpenClaw any voice note - a plain question is enough, no need"
-echo "      to ask for voice back. It should reply with text AND a voice note."
+echo "  Try it on WhatsApp now:"
+echo "    - Send OpenClaw a voice note - it should reply with an actual"
+echo "      spoken voice note, not text."
 echo "    - A typed text message should still get a text-only reply."
+echo ""
+echo "  Don't like the default voice? List real options and switch any time:"
+echo "    ${CYAN}sudo docker compose -f ${DEPLOY_DIR}/docker-compose.yml run --rm openclaw-cli capability tts voices --provider elevenlabs${RESET}"
+echo "    ${CYAN}sudo docker compose -f ${DEPLOY_DIR}/docker-compose.yml run --rm -T openclaw-cli config set messages.tts.providers.elevenlabs.speakerVoiceId <id>${RESET}"
+echo "    ${CYAN}sudo docker compose -f ${DEPLOY_DIR}/docker-compose.yml restart openclaw-gateway${RESET}"
 echo ""
 echo "  ${YELLOW}${BOLD}One thing to know:${RESET} 'sudo agentic update' will fail to pull"
 echo "  openclaw-gateway from now on, because it points at a local image, not"
