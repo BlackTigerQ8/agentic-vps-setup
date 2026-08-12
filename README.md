@@ -126,13 +126,31 @@ Want OpenClaw to understand a voice note you send it, and reply back with a spok
 curl -fsSL https://raw.githubusercontent.com/BlackTigerQ8/agentic-vps-setup/main/connect_elevenlabs.sh -o connect_elevenlabs.sh && sudo bash connect_elevenlabs.sh
 ```
 
-Three questions: your [ElevenLabs](https://elevenlabs.io) API key, a voice ID (optional — leave blank to use your account's default voice), and whether to echo the transcript of incoming voice notes into the chat alongside OpenClaw's response (handy for a bootcamp demo, easy to say no to). It validates the config against OpenClaw's schema before restarting the gateway, so a bad value gets caught before anything reloads broken.
+Three questions: your [ElevenLabs](https://elevenlabs.io) API key, a voice ID (optional — leave blank for a standard default voice), and whether to echo the transcript of incoming voice notes into the chat alongside OpenClaw's response (handy for a bootcamp demo, easy to say no to). It validates the config against OpenClaw's schema, then does a real synthesis test against ElevenLabs before declaring success — so a bad key, an out-of-credits account, or an invalid voice ID gets caught during setup, not discovered later on WhatsApp.
 
-**This is a hard switch, not agent judgment** — unlike the n8n skill, every WhatsApp reply becomes a spoken voice note once this is on, all the time. If that's too much, dial it back manually: `sudo docker exec openclaw-gateway openclaw config set tts.auto never`.
+**It only speaks when spoken to** — voice-in triggers voice-out; a typed message still gets a typed reply. This is a real switch on the gateway itself (`messages.tts.auto: "inbound"`), not something the model decides case by case.
 
-Voice notes *in* use OpenClaw's own built-in audio understanding, not ElevenLabs — there's no separate setup needed for that half, this script just switches it on.
+Voice notes *in* are transcribed by ElevenLabs too, reusing the same API key — no separate subscription, works the same on a free ElevenLabs plan.
 
 **Changed your mind about the voice, or your key?** Run the script again — it overwrites cleanly, nothing to remove first.
+
+---
+
+### Gmail on WhatsApp
+
+Want *"Summarize my last 3 unread emails"* to work? Another standalone script:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/BlackTigerQ8/agentic-vps-setup/main/connect_gmail.sh -o connect_gmail.sh && sudo bash connect_gmail.sh
+```
+
+You'll need a **Gmail App Password**, not your real Google password: `myaccount.google.com` → Security → turn on 2-Step Verification if it's off → App passwords → create one → copy the 16-character code.
+
+This uses [Himalaya](https://github.com/pimalaya/himalaya) rather than OpenClaw's bundled Gmail skill (`gog`) — `gog` has no working Linux binary and its source build fails, a known, closed-as-not-planned upstream limitation, not something fixable from this repo. Himalaya does the same job (read, search, summarize, reply) over plain IMAP/SMTP, with real Linux binaries. If you already ran `connect_elevenlabs.sh`, this adds to that same custom image rather than replacing it — voice and Gmail work together.
+
+Verifies with a real inbox call before declaring success, same reasoning as the voice script.
+
+**Changed your Gmail address or App Password?** Run the script again.
 
 ---
 
@@ -231,6 +249,8 @@ It is on port **18789**, not 8080. You do not need an SSH tunnel — use `https:
 | `/var/log/agentic-setup.log` | Full setup transcript |
 | `/etc/agentic-stack.conf` | Saved answers, reused on re-runs |
 | `/opt/agentic-stack/openclaw-workspace/n8n-automation/SKILL.md` | Written by `connect_n8n.sh` |
+| `/opt/agentic-stack/openclaw/himalaya/config.toml` | Gmail credentials, written by `connect_gmail.sh` |
+| `/opt/agentic-stack/Dockerfile.openclaw` | Custom image (ffmpeg / himalaya), built by `connect_elevenlabs.sh` and/or `connect_gmail.sh` |
 
 ---
 
@@ -292,7 +312,9 @@ Run the script yourself first, note the versions it pulled with `sudo agentic st
 
 **`connect_n8n.sh` — new, standalone.** Wires a WhatsApp message to an n8n workflow via an OpenClaw skill, without hand-authoring markdown or running `docker exec`. It's deliberately its own script rather than a `vps_setup.sh`/`agentic` addition — it works on any server already built, needs no re-run of setup, and can't put the stack's core scripts at risk while it's iterated on. Ships this way because OpenClaw has no GUI and no deterministic "every message forwards" mechanism for this (checked against the live CLI: `webhooks` only handles Gmail, `hooks` fires on lifecycle events like `/new`/`/reset`, not incoming messages) — the only real integration path is an agent skill, which means this is judgment-based, not a hard trigger. Test with an unambiguous message first.
 
-**`connect_elevenlabs.sh` — new, standalone.** Turns on ElevenLabs voice replies and voice-note understanding via `openclaw config set`, same non-`vps_setup.sh` reasoning as above. Unlike the n8n skill, this one is a hard switch (`tts.auto: "always"`) — every reply becomes a spoken voice note, no model judgment involved, so try it before deciding it's the right default for a whole class. Two field names (`speakerVoiceId`, `model`) were confirmed against `openclaw config schema` directly rather than trusted from docs — two independent doc pages disagreed with each other on those exact names.
+**`connect_elevenlabs.sh` — new, standalone.** Turns on ElevenLabs voice replies and voice-note understanding via `openclaw config set`, same non-`vps_setup.sh` reasoning as above. Unlike the n8n skill, this is a real gateway-level switch (`messages.tts.auto: "inbound"`) — voice-in triggers voice-out deterministically, no model judgment involved. Getting here took real debugging: `tts.*` (top-level) doesn't exist despite official docs showing it; the correct namespace is `messages.tts.*`. A provider with only an API key — no `speakerVoiceId`, no `model` — reports as "configured" and passes validation while silently never synthesizing anything, no error anywhere. And a secret-reference object for `apiKey` (`{"source":"env",...}`) requires a *registered* secret provider that doesn't exist by default and crash-loops the gateway on every restart — use a plain string. Full writeup in `HANDOFF.md` §5.
+
+**`connect_gmail.sh` — new, standalone.** OpenClaw's bundled `gog` skill for Gmail/Workspace has no working Linux binary and its source build fails (`openclaw/openclaw#9420`, closed as not planned upstream) — don't spend class time on it. This script wires up Himalaya instead, a real cross-platform IMAP/SMTP CLI, as a bundled skill the same way. Appends to the existing custom image rather than replacing it, so it coexists with `connect_elevenlabs.sh`'s ffmpeg build.
 
 **What changed in 3.0.0**
 
