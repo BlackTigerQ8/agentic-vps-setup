@@ -77,11 +77,19 @@ else
       exit 1
     fi
     print_step "Allowing n8n to read from /home/node/local-files"
-    awk -v newline="$NEW_ENV_LINE" '
+    # Match the indentation of the line already under "environment:" instead
+    # of assuming a fixed width — a hardcoded guess here is what broke the
+    # YAML last time on a file indented differently than expected.
+    awk '
       /container_name: n8n$/ { in_n8n=1 }
       in_n8n && /^[[:space:]]*environment:/ && !done {
         print
-        print newline
+        if ((getline nextline) > 0) {
+          match(nextline, /^[[:space:]]*/)
+          indent = substr(nextline, RSTART, RLENGTH)
+          print indent "- N8N_RESTRICT_FILE_ACCESS_TO=/home/node/local-files"
+          print nextline
+        }
         done=1
         next
       }
@@ -94,13 +102,20 @@ else
   grep -qF "$MOUNT_MARKER" "$COMPOSE_FILE" || MOUNT_OK=false
   grep -qF "$ENV_MARKER" "$COMPOSE_FILE" || ENV_OK=false
 
-  if [[ "$MOUNT_OK" == true && "$ENV_OK" == true ]]; then
-    print_ok "docker-compose.yml updated."
+  # Text being present isn't enough — confirm the file still actually parses
+  # as valid YAML before trusting it. This is the check that would have
+  # caught a misindented insertion instead of handing docker a broken file.
+  YAML_OK=true
+  (cd "$DEPLOY_DIR" && docker compose config --quiet) 2>/dev/null || YAML_OK=false
+
+  if [[ "$MOUNT_OK" == true && "$ENV_OK" == true && "$YAML_OK" == true ]]; then
+    print_ok "docker-compose.yml updated and confirmed valid."
   else
     print_err "Automatic edit did not verify correctly — restoring the backup, no changes kept."
     cp "$BACKUP" "$COMPOSE_FILE"
     [[ "$MOUNT_OK" == false ]] && { print_err "Add this yourself under 'volumes:':"; echo "$NEW_VOLUME_LINE"; }
     [[ "$ENV_OK" == false ]] && { print_err "Add this yourself under 'environment:':"; echo "$NEW_ENV_LINE"; }
+    [[ "$YAML_OK" == false ]] && print_err "The edit broke the YAML structure — run 'docker compose config' after adding the lines above by hand to confirm it's valid before recreating the container."
     exit 1
   fi
 
