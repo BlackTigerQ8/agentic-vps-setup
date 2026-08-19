@@ -154,6 +154,26 @@ Verifies with a real inbox call before declaring success, same reasoning as the 
 
 ---
 
+### Local files for document-grounded agents
+
+Building an agent that answers from a trainee's own documents — a RAG-style workflow? Another standalone script:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/BlackTigerQ8/agentic-vps-setup/main/connect_local_files.sh -o connect_local_files.sh && sudo bash connect_local_files.sh
+```
+
+Creates `/opt/agentic-stack/local-files` and mounts it into the n8n container. n8n's own `/home/node/.n8n` volume is reserved for its internal state, so source documents need a folder of their own — this is it. Upload files there from your own machine:
+
+```bash
+scp yourfile.pdf root@YOUR_VPS_IP:/opt/agentic-stack/local-files/
+```
+
+Subfolders work — a bind mount carries the whole directory tree, not just the top level. In n8n, read a file with the **Read/Write Files from Disk** node, pointed at the matching path inside the container: `/home/node/local-files/yourfile.pdf`.
+
+Backs up `docker-compose.yml` before editing it and verifies the new mount line actually landed, restoring the backup automatically if not — nothing is left half-edited. Safe to run again; skips the edit entirely if the mount is already there.
+
+---
+
 ## The `agentic` command
 
 The setup script installs a helper so nobody has to remember Docker commands.
@@ -251,6 +271,7 @@ It is on port **18789**, not 8080. You do not need an SSH tunnel — use `https:
 | `/opt/agentic-stack/openclaw-workspace/n8n-automation/SKILL.md` | Written by `connect_n8n.sh` |
 | `/opt/agentic-stack/openclaw/himalaya/config.toml` | Gmail credentials, written by `connect_gmail.sh` |
 | `/opt/agentic-stack/Dockerfile.openclaw` | Custom image (ffmpeg / himalaya), built by `connect_elevenlabs.sh` and/or `connect_gmail.sh` |
+| `/opt/agentic-stack/local-files/` | Source documents for RAG-style agents — mounted into n8n at `/home/node/local-files/`, created by `connect_local_files.sh` |
 
 ---
 
@@ -315,6 +336,8 @@ Run the script yourself first, note the versions it pulled with `sudo agentic st
 **`connect_elevenlabs.sh` — new, standalone.** Turns on ElevenLabs voice replies and voice-note understanding via `openclaw config set`, same non-`vps_setup.sh` reasoning as above. Unlike the n8n skill, this is a real gateway-level switch (`messages.tts.auto: "inbound"`) — voice-in triggers voice-out deterministically, no model judgment involved. Getting here took real debugging: `tts.*` (top-level) doesn't exist despite official docs showing it; the correct namespace is `messages.tts.*`. A provider with only an API key — no `speakerVoiceId`, no `model` — reports as "configured" and passes validation while silently never synthesizing anything, no error anywhere. And a secret-reference object for `apiKey` (`{"source":"env",...}`) requires a *registered* secret provider that doesn't exist by default and crash-loops the gateway on every restart — use a plain string. Full writeup in `HANDOFF.md` §5.
 
 **`connect_gmail.sh` — new, standalone.** OpenClaw's bundled `gog` skill for Gmail/Workspace has no working Linux binary and its source build fails (`openclaw/openclaw#9420`, closed as not planned upstream) — don't spend class time on it. This script wires up Himalaya instead, a real cross-platform IMAP/SMTP CLI, as a bundled skill the same way. Appends to the existing custom image rather than replacing it, so it coexists with `connect_elevenlabs.sh`'s ffmpeg build.
+
+**`connect_local_files.sh` — new, standalone.** Gives trainees a way to get their own source documents onto the VPS for RAG-style agents, without hand-editing `docker-compose.yml`. n8n's own data volume (`/home/node/.n8n`) is explicitly reserved for internal state per n8n's own docs, so this mounts a dedicated `local-files` folder instead — the same convention n8n's documentation recommends for this exact use case. Idempotent, and deliberately defensive about the one risky step: compose-file edits that go wrong silently are exactly what can leave a stack half-broken, so it backs up `docker-compose.yml` before editing it and verifies the new volume line actually landed before recreating the container, rolling back automatically if the edit didn't take.
 
 **What changed in 3.0.0**
 
