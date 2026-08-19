@@ -162,7 +162,7 @@ Building an agent that answers from a trainee's own documents — a RAG-style wo
 curl -fsSL https://raw.githubusercontent.com/BlackTigerQ8/agentic-vps-setup/main/connect_local_files.sh -o connect_local_files.sh && sudo bash connect_local_files.sh
 ```
 
-Creates `/opt/agentic-stack/local-files` and mounts it into the n8n container. n8n's own `/home/node/.n8n` volume is reserved for its internal state, so source documents need a folder of their own — this is it. Upload files there from your own machine:
+Creates `/opt/agentic-stack/local-files`, mounts it into the n8n container, and grants n8n permission to read from it. n8n's own `/home/node/.n8n` volume is reserved for its internal state, so source documents need a folder of their own — this is it. Upload files there from your own machine:
 
 ```bash
 scp yourfile.pdf root@YOUR_VPS_IP:/opt/agentic-stack/local-files/
@@ -170,7 +170,9 @@ scp yourfile.pdf root@YOUR_VPS_IP:/opt/agentic-stack/local-files/
 
 Subfolders work — a bind mount carries the whole directory tree, not just the top level. In n8n, read a file with the **Read/Write Files from Disk** node, pointed at the matching path inside the container: `/home/node/local-files/yourfile.pdf`.
 
-Backs up `docker-compose.yml` before editing it and verifies the new mount line actually landed, restoring the backup automatically if not — nothing is left half-edited. Safe to run again; skips the edit entirely if the mount is already there.
+**The mount alone isn't enough.** Since n8n 2.0, the Read/Write Files node is restricted to `~/.n8n-files` by default even when you never configured that — so without the matching permission, the files sit there mounted and readable while n8n still refuses them with *"Access to the file is not allowed."* The script sets `N8N_RESTRICT_FILE_ACCESS_TO` in `stack.env` to cover this.
+
+Backs up `docker-compose.yml` before editing it, then confirms the file still parses as valid YAML before restarting anything — restoring the backup automatically if either check fails, so nothing is left half-edited. Safe to run again; skips whatever is already in place.
 
 ---
 
@@ -337,7 +339,11 @@ Run the script yourself first, note the versions it pulled with `sudo agentic st
 
 **`connect_gmail.sh` — new, standalone.** OpenClaw's bundled `gog` skill for Gmail/Workspace has no working Linux binary and its source build fails (`openclaw/openclaw#9420`, closed as not planned upstream) — don't spend class time on it. This script wires up Himalaya instead, a real cross-platform IMAP/SMTP CLI, as a bundled skill the same way. Appends to the existing custom image rather than replacing it, so it coexists with `connect_elevenlabs.sh`'s ffmpeg build.
 
-**`connect_local_files.sh` — new, standalone.** Gives trainees a way to get their own source documents onto the VPS for RAG-style agents, without hand-editing `docker-compose.yml`. n8n's own data volume (`/home/node/.n8n`) is explicitly reserved for internal state per n8n's own docs, so this mounts a dedicated `local-files` folder instead — the same convention n8n's documentation recommends for this exact use case. Idempotent, and deliberately defensive about the one risky step: compose-file edits that go wrong silently are exactly what can leave a stack half-broken, so it backs up `docker-compose.yml` before editing it and verifies the new volume line actually landed before recreating the container, rolling back automatically if the edit didn't take.
+**`connect_local_files.sh` — new, standalone.** Gives trainees a way to get their own source documents onto the VPS for RAG-style agents, without hand-editing `docker-compose.yml`. n8n's own data volume (`/home/node/.n8n`) is explicitly reserved for internal state per n8n's own docs, so this mounts a dedicated `local-files` folder instead — the same convention n8n's documentation recommends for this exact use case.
+
+Two gotchas cost real debugging time here, both worth knowing before a trainee hits them. First, **the mount is only half the job**: n8n 2.0 restricts the Read/Write Files node to `~/.n8n-files` by *default*, with no such variable set anywhere — so `docker exec n8n env | grep RESTRICT` comes back empty while the node still refuses every path, and mount/permissions/path checks all pass while the error persists. Second, **that setting goes in `stack.env`, not `docker-compose.yml`**: the compose file's `environment:` block uses mapping syntax (`KEY: value`), so appending a list item (`- KEY=value`) to it is invalid YAML and breaks the whole stack definition. `stack.env` is already wired in via `env_file` and is plain `KEY=value`, so there's no YAML structure to get wrong.
+
+Idempotent, and defensive about the one risky step: it backs up `docker-compose.yml`, then validates the result with `docker compose config` — an actual YAML parse, not just a grep for the inserted text — before restarting anything, rolling back automatically if either check fails.
 
 **What changed in 3.0.0**
 
